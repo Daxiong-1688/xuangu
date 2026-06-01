@@ -59,6 +59,35 @@ THEME_KEYWORDS = (
     "电力",
     "高端制造",
 )
+POSITIVE_HOTSPOT_TERMS = (
+    "政策",
+    "订单",
+    "业绩",
+    "景气",
+    "资本开支",
+    "Capex",
+    "需求",
+    "涨停",
+    "突破",
+    "国产替代",
+    "产业链",
+    "加速",
+    "落地",
+)
+NEGATIVE_HOTSPOT_TERMS = (
+    "退潮",
+    "回调",
+    "高位",
+    "资金流出",
+    "减持",
+    "估值过高",
+    "跌幅居前",
+    "谨慎",
+    "调整",
+    "分化",
+    "套现",
+    "欺诈",
+)
 THEME_STOCK_UNIVERSE = {
     "AI算力": [
         ("300308.SZ", "中际旭创"),
@@ -973,10 +1002,100 @@ def detect_themes(items):
     return ranked[:6]
 
 
+def interpret_hotspots(items):
+    raw_themes = detect_themes(items)
+    if not raw_themes:
+        raw_themes = [(theme, 0) for theme in DEFAULT_HOT_THEMES[:4]]
+
+    analyses = []
+    for theme, count in raw_themes:
+        related_items = [
+            item
+            for item in items
+            if theme in f"{item.get('title', '')} {item.get('snippet', '')}"
+        ]
+        text = " ".join(f"{item.get('title', '')} {item.get('snippet', '')}" for item in related_items)
+        positive_hits = [term for term in POSITIVE_HOTSPOT_TERMS if term in text]
+        negative_hits = [term for term in NEGATIVE_HOTSPOT_TERMS if term in text]
+        source_count = len(related_items)
+        recent_count = 0
+        for item in related_items:
+            published = parse_item_datetime(item.get("_published_at") or item.get("date"))
+            if published and published >= datetime.now() - timedelta(days=1):
+                recent_count += 1
+
+        score = 45 + count * 8 + min(12, len(positive_hits) * 4) + min(10, recent_count * 3)
+        score -= min(24, len(negative_hits) * 6)
+        score = max(0, min(100, score))
+
+        if score >= 75 and not negative_hits:
+            quality = "高质量热点"
+            action = "可进入重点候选池"
+        elif score >= 60:
+            quality = "可跟踪热点"
+            action = "进入候选池但降低追高权重"
+        elif negative_hits:
+            quality = "分化/过热热点"
+            action = "只观察龙头和低位修复，不因热点直接加分"
+        else:
+            quality = "弱确认热点"
+            action = "暂不作为核心选股依据"
+
+        if negative_hits:
+            risk = "、".join(negative_hits[:3])
+        else:
+            risk = "暂无明显退潮信号"
+        if positive_hits:
+            support = "、".join(positive_hits[:3])
+        else:
+            support = "缺少明确业绩/政策催化"
+
+        analyses.append(
+            {
+                "主题": theme,
+                "热度次数": count,
+                "近24小时": recent_count,
+                "来源数": source_count,
+                "热点质量分": round(score, 1),
+                "质量判断": quality,
+                "支撑因素": support,
+                "风险信号": risk,
+                "选股处理": action,
+            }
+        )
+
+    analyses.sort(key=lambda row: row["热点质量分"], reverse=True)
+    return analyses
+
+
+def hotspot_interpretation_markdown(rows):
+    if not rows:
+        return "暂无足够热点信息进行质量解读。"
+    headers = ["主题", "热点质量分", "质量判断", "支撑因素", "风险信号", "选股处理"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
+    lines.extend(
+        [
+            "",
+            "说明：热点只作为第一层过滤，不等同于投资价值。出现退潮、高位、资金流出、估值过高等信号时，候选股会降权，必须再通过趋势、成长、估值完整性和风险检查。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def latest_theme_names(payloads):
     ai_items = fresh_search_items(payloads["search_ai_news"][1])
     market_items = fresh_search_items(payloads["search_market_hotspots"][1])
-    names = [name for name, _ in detect_themes(combine_fresh_news(market_items, ai_items, limit=20))]
+    interpreted = interpret_hotspots(combine_fresh_news(market_items, ai_items, limit=20))
+    names = [
+        row["主题"]
+        for row in interpreted
+        if row["热点质量分"] >= 55 and row["质量判断"] != "弱确认热点"
+    ]
     for theme in DEFAULT_HOT_THEMES:
         if theme not in names:
             names.append(theme)
@@ -1055,10 +1174,37 @@ def candidate_rows_from_response(fin_candidates_response, themes=None, limit=MAX
     return curated_candidate_rows(themes, limit=limit)
 
 
+def apply_hotspot_quality_to_candidates(rows, hotspot_rows):
+    quality_by_theme = {row["主题"]: row for row in hotspot_rows}
+    adjusted = []
+    for row in rows:
+        theme = row.get("所属主题", "")
+        matched = None
+        for name, info in quality_by_theme.items():
+            if name in theme or theme in name:
+                matched = info
+                break
+        if matched:
+            row = dict(row)
+            row["热点质量"] = matched["质量判断"]
+            row["热点处理"] = matched["选股处理"]
+            row["_score"] = row.get("_score", 0) + max(-2, int((matched["热点质量分"] - 60) / 15))
+            if matched["质量判断"] == "分化/过热热点":
+                row["主要风险"] = compact_text(row.get("主要风险", "") + "；热点存在分化或过热信号")
+            adjusted.append(row)
+        else:
+            row = dict(row)
+            row["热点质量"] = "待确认"
+            row["热点处理"] = "不因热点直接加分"
+            adjusted.append(row)
+    adjusted.sort(key=lambda item: item.get("_score", 0), reverse=True)
+    return adjusted
+
+
 def candidate_rows_markdown(rows):
     if not rows:
         return ""
-    headers = ["股票代码", "股票名称", "所属主题", "热点触发", "主营关联度", "主要风险"]
+    headers = ["股票代码", "股票名称", "所属主题", "热点质量", "热点处理", "热点触发", "主营关联度", "主要风险"]
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
@@ -1123,6 +1269,8 @@ def make_html_report(run_id, payloads):
     market_items = fresh_search_items(payloads["search_market_hotspots"][1])
     combined = combine_fresh_news(market_items, ai_items, limit=12)
     themes = detect_themes(combined)
+    hotspot_rows = interpret_hotspots(combined)
+    hotspot_markdown = hotspot_interpretation_markdown(hotspot_rows)
     valuation_allowed = valuation_is_complete(collect_valuation_metrics(payloads["fin_trends"][1]))
     selected_candidates = payloads.get("selected_candidates", [])
     candidate_markdown = candidate_rows_markdown(selected_candidates) or candidate_display_markdown(
@@ -1197,6 +1345,7 @@ def make_html_report(run_id, payloads):
         for section in trend_sections
     )
     technical_html = markdown_table_to_html(technical_markdown, limit=5)
+    hotspot_html = markdown_table_to_html(hotspot_markdown, limit=8)
     valuation_html = markdown_table_to_html(valuation_markdown, limit=24) if valuation_markdown else ""
     growth_html = markdown_table_to_html(growth_markdown, limit=12) if growth_markdown else ""
 
@@ -1348,6 +1497,11 @@ def make_html_report(run_id, payloads):
     </section>
 
     <section class="section">
+      <h2>热点解读与筛选门槛</h2>
+      {hotspot_html}
+    </section>
+
+    <section class="section">
       <h2>技术结构层与 TOP 5</h2>
       <div class="score-note">
         <div><strong>趋势/动量</strong>均线、相对强弱、ROC、MACD/RSI状态</div>
@@ -1409,6 +1563,8 @@ def render_png_from_html(html_path, png_path):
 def make_report(run_id, payloads):
     ai_items = fresh_search_items(payloads["search_ai_news"][1])
     market_items = fresh_search_items(payloads["search_market_hotspots"][1])
+    combined = combine_fresh_news(market_items, ai_items, limit=12)
+    hotspot_text = hotspot_interpretation_markdown(interpret_hotspots(combined))
     valuation_allowed = valuation_is_complete(collect_valuation_metrics(payloads["fin_trends"][1]))
     selected_candidates = payloads.get("selected_candidates", [])
     candidates_text = candidate_rows_markdown(selected_candidates) or candidate_display_markdown(
@@ -1434,7 +1590,6 @@ def make_report(run_id, payloads):
         "",
     ]
 
-    combined = combine_fresh_news(market_items, ai_items, limit=12)
     for idx, item in enumerate(combined[:10], 1):
         title = item.get("title", "无标题")
         date = item.get("_published_at") or item.get("date", "")
@@ -1453,29 +1608,33 @@ def make_report(run_id, payloads):
     lines.extend(
         [
             "",
-            "## 2. 技术结构层与 TOP 5",
+            "## 2. 热点解读与筛选门槛",
+            "",
+            hotspot_text,
+            "",
+            "## 3. 技术结构层与 TOP 5",
             "",
             technical_text,
             "",
-            "## 3. 候选股票池查询结果",
+            "## 4. 候选股票池查询结果",
             "",
             candidates_text[:5000],
             "",
-            "## 4. 估值指标",
+            "## 5. 估值指标",
             "",
             valuation_text or "估值指标覆盖不完整，本轮不展示、不参与评分。",
             "",
-            "## 5. 成长与业绩指标",
+            "## 6. 成长与业绩指标",
             "",
             growth_text or "成长与业绩指标覆盖不完整，本轮不展示、不参与评分。",
             "",
-            "## 6. 历史股价与趋势查询结果",
+            "## 7. 历史股价与趋势查询结果",
             "",
             trend_text[:5000],
             "",
-            "## 7. 本轮流程结论",
+            "## 8. 本轮流程结论",
             "",
-            "- 本轮已完成：热点扫描、候选方向识别、候选股/趋势/财务数据查询、技术结构评估和 TOP 5 输出。",
+            "- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/趋势/财务数据查询、技术结构评估和 TOP 5 输出。",
             "- 下一步建议：把 TOP 5 中你认可的股票加入 `watchlist.json`，再跑自选股追踪日报。",
             "- 如果金融数据返回里某些字段缺失，后续工作流会把这些字段标记为“暂无数据”，不硬编数字。",
         ]
@@ -1529,12 +1688,20 @@ def main():
     time.sleep(1)
 
     themes = latest_theme_names(payloads)
+    hotspot_rows = interpret_hotspots(
+        combine_fresh_news(
+            fresh_search_items(payloads["search_market_hotspots"][1]),
+            fresh_search_items(payloads["search_ai_news"][1]),
+            limit=20,
+        )
+    )
     print("running fin_candidates...", flush=True)
     status, response = yixin_fin_db(fin_db_key, build_candidate_query(themes))
     payloads["fin_candidates"] = (status, response)
     with (DATA_DIR / f"{run_id}-fin_candidates.json").open("w", encoding="utf-8") as file:
         json.dump({"status": status, "response": response}, file, ensure_ascii=False, indent=2)
     selected_candidates = candidate_rows_from_response(response, themes=themes)
+    selected_candidates = apply_hotspot_quality_to_candidates(selected_candidates, hotspot_rows)
     payloads["selected_candidates"] = selected_candidates
     EXPECTED_STOCK_COUNT = max(5, len(selected_candidates))
     with (DATA_DIR / f"{run_id}-selected_candidates.json").open("w", encoding="utf-8") as file:

@@ -65,13 +65,17 @@ python3 ~/.codex/skills/yixin-stock-workflow/scripts/run_yixin_stock_workflow.py
 
 1. Query recent market/AI-related news with `search`.
 2. Apply local freshness filters: recent dates only, useful snippets only, low-quality sources removed, duplicate titles removed.
-3. Query candidate stocks and trend data with `fin_db`.
-4. Clean candidate tables: remove duplicate stocks, sparse columns, and incomplete valuation columns.
-5. Apply completeness gates:
+3. Interpret hotspot quality before stock selection:
+   - Positive signals: policy support, orders, earnings, demand, capex, domestic substitution,产业链落地.
+   - Negative signals: 退潮, 高位, 资金流出, 减持, 估值过高, 分化, 套现.
+   - Hotspots with weak or overheated signals are downgraded instead of directly added to scores.
+4. Query candidate stocks and trend data with `fin_db`.
+5. Clean candidate tables: remove duplicate stocks, sparse columns, and incomplete valuation columns.
+6. Apply completeness gates:
    - PE/PB is displayed and scored only when complete enough.
    - If valuation is incomplete, hide it and use growth metrics instead.
-6. Generate a technical-structure TOP 5 using available trend, moving-average, 52-week-position, volume, and growth data.
-7. Export Markdown, HTML, and PNG reports.
+7. Generate a technical-structure TOP 5 using available trend, moving-average, 52-week-position, volume, and growth data.
+8. Export Markdown, HTML, and PNG reports.
 
 ## Technical Structure Model
 
