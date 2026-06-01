@@ -1,0 +1,3 @@
+display_name: Yixin Stock Workflow
+short_description: Generate Yixin-powered A-share stock research reports.
+default_prompt: Use $yixin-stock-workflow to run the stock research workflow and generate HTML and image reports.
