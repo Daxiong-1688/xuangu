@@ -497,6 +497,66 @@ def drop_sparse_markdown_columns(markdown_text, max_missing_ratio=0.35):
     return "\n".join(lines)
 
 
+def markdown_from_dict_rows(rows, headers):
+    kept_rows = []
+    for row in rows:
+        values = [compact_text(row.get(header, "")) for header in headers]
+        if any(not clean_missing_cell(value) for value in values):
+            kept_rows.append(values)
+    if not kept_rows:
+        return ""
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in kept_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def compact_fin_section_content(section):
+    rows = rows_to_dicts(section["content"])
+    if not rows:
+        return ""
+
+    if {"wind_code", "item_name", "item_value"}.issubset(rows[0].keys()):
+        compact_rows = []
+        for row in rows:
+            value = first_present(row, ("item_value", "指标值", "value"))
+            if value is None:
+                continue
+            compact_rows.append(
+                {
+                    "股票代码": row_stock_code(row),
+                    "股票名称": clean_stock_name(row_stock_name(row)),
+                    "指标": row_item_name(row),
+                    "数值": compact_text(value),
+                    "单位": compact_text(row.get("item_unit", "")),
+                    "时间": compact_text(row.get("time_scope_value", "")),
+                }
+            )
+        return markdown_from_dict_rows(compact_rows, ["股票代码", "股票名称", "指标", "数值", "单位", "时间"])
+
+    content = drop_markdown_columns(
+        section["content"],
+        (
+            "Index",
+            "entity_order",
+            "comp_code",
+            "source_table",
+            "subject_type",
+            "time_scope_type",
+            "item_group",
+            "item_key",
+            "value_type",
+            "rank_no",
+            "context_type",
+            "context_value",
+        ),
+    )
+    return drop_sparse_markdown_columns(content, max_missing_ratio=0.2)
+
+
 def parse_number(value):
     if value is None:
         return None
@@ -508,6 +568,29 @@ def parse_number(value):
         return float(match.group(0))
     except ValueError:
         return None
+
+
+def first_present(row, keys):
+    for key in keys:
+        value = row.get(key)
+        if value is not None and not clean_missing_cell(value):
+            return value
+    return None
+
+
+def first_key_containing(row, *needles):
+    for key, value in row.items():
+        if all(needle in key for needle in needles) and not clean_missing_cell(value):
+            return value
+    return None
+
+
+def row_item_key(row):
+    return compact_text(row.get("item_key") or row.get("指标代码") or row.get("指标") or "")
+
+
+def row_item_name(row):
+    return compact_text(row.get("item_name") or row.get("指标名称") or row_item_key(row))
 
 
 def clean_stock_name(value):
@@ -554,29 +637,29 @@ def markdown_table_to_html(text, limit=12):
 
 def compact_valuation_markdown(fin_trends_response):
     valuation_by_code = collect_valuation_metrics(fin_trends_response)
-    if not valuation_is_complete(valuation_by_code):
+    if not valuation_has_coverage(valuation_by_code):
         return ""
 
-    headers = ["股票代码", "股票名称", "指标", "数值", "单位"]
+    headers = ["股票代码", "股票名称", "市盈率(TTM)", "市净率(LF)"]
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     for code, item in sorted(valuation_by_code.items()):
-        for key, label in (("pe_ttm", "市盈率(TTM)"), ("pb", "市净率(LF)")):
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        code,
-                        item["name"],
-                        label,
-                        f"{item[key]:g}",
-                        "倍",
-                    ]
-                )
-                + " |"
+        if item.get("pe_ttm") is None and item.get("pb") is None:
+            continue
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    code,
+                    item["name"],
+                    f"{item['pe_ttm']:g}" if item.get("pe_ttm") is not None else "暂无",
+                    f"{item['pb']:g}" if item.get("pb") is not None else "暂无",
+                ]
             )
+            + " |"
+        )
     return "\n".join(lines)
 
 
@@ -586,11 +669,11 @@ def collect_valuation_metrics(fin_trends_response):
         if not any(keyword in section["query"] for keyword in ("市盈率", "市净率", "估值")):
             continue
         for row in rows_to_dicts(section["content"]):
-            code = row.get("wind_code") or row.get("证券代码") or row.get("股票代码")
-            name = row.get("matched_company_name") or row.get("公司名称") or row.get("证券简称")
-            item_key = row.get("item_key") or row.get("指标代码") or row.get("指标")
-            item_name = row.get("item_name") or row.get("指标名称") or item_key
-            value = parse_number(row.get("item_value") or row.get("指标值") or row.get("value"))
+            code = row_stock_code(row)
+            name = row_stock_name(row)
+            item_key = row_item_key(row)
+            item_name = row_item_name(row)
+            value = parse_number(first_present(row, ("item_value", "指标值", "value")))
             if not code or not name or value is None:
                 continue
             item = valuation_by_code.setdefault(code, {"name": clean_stock_name(name)})
@@ -603,10 +686,17 @@ def collect_valuation_metrics(fin_trends_response):
     return valuation_by_code
 
 
+def valuation_has_coverage(valuation_by_code, min_coverage=0.8):
+    usable = [
+        item
+        for item in valuation_by_code.values()
+        if item.get("pe_ttm") is not None or item.get("pb") is not None
+    ]
+    return len(usable) >= EXPECTED_STOCK_COUNT * min_coverage
+
+
 def valuation_is_complete(valuation_by_code):
-    if len(valuation_by_code) < EXPECTED_STOCK_COUNT:
-        return False
-    return all("pe_ttm" in item and "pb" in item for item in valuation_by_code.values())
+    return valuation_has_coverage(valuation_by_code)
 
 
 def collect_growth_metrics(fin_trends_response):
@@ -615,17 +705,26 @@ def collect_growth_metrics(fin_trends_response):
         if not any(keyword in section["query"] for keyword in ("营业收入", "净利润", "同比")):
             continue
         for row in rows_to_dicts(section["content"]):
-            code = row.get("wind_code") or row.get("证券代码") or row.get("股票代码")
-            name = row.get("matched_company_name") or row.get("公司名称") or row.get("证券简称")
+            code = row_stock_code(row)
+            name = row_stock_name(row)
             if not code or not name:
                 continue
             item = growth_by_code.setdefault(code, {"name": clean_stock_name(name)})
-            item_name = row.get("item_name") or row.get("指标名称") or row.get("item_key") or ""
-            value = parse_number(row.get("item_value") or row.get("指标值") or row.get("营业收入同比增速(%)"))
-            if "营业收入同比" in row:
-                item["revenue_yoy"] = parse_number(row.get("营业收入同比增速(%)"))
-            if "净利润同比" in row:
-                item["profit_yoy"] = parse_number(row.get("净利润同比增速(%)"))
+            item_name = row_item_name(row)
+            value = parse_number(first_present(row, ("item_value", "指标值", "value")))
+            revenue_value = parse_number(
+                first_present(row, ("营业收入同比增速(%)", "营业收入同比增速_百分号", "营收同比(%)"))
+                or first_key_containing(row, "营业收入", "同比")
+                or first_key_containing(row, "营收", "同比")
+            )
+            profit_value = parse_number(
+                first_present(row, ("净利润同比增速(%)", "净利润同比增速_百分号", "净利润同比(%)"))
+                or first_key_containing(row, "净利润", "同比")
+            )
+            if revenue_value is not None:
+                item["revenue_yoy"] = revenue_value
+            if profit_value is not None:
+                item["profit_yoy"] = profit_value
             if value is None:
                 continue
             if "营业收入" in item_name or row.get("item_key") == "yoy_or":
@@ -682,21 +781,15 @@ def section_has_enough_coverage(markdown_text, expected=EXPECTED_STOCK_COUNT, mi
 
 
 def display_fin_sections(fin_response):
-    valuation_complete = valuation_is_complete(collect_valuation_metrics(fin_response))
     sections = []
     for section in extract_fin_sections(fin_response):
         is_valuation = any(keyword in section["query"] for keyword in ("市盈率", "市净率", "估值"))
         is_growth = any(keyword in section["query"] for keyword in ("营业收入", "净利润", "同比"))
         if is_valuation or is_growth:
             continue
-        if section_has_enough_coverage(section["content"]):
-            sections.append(section)
-    if valuation_complete:
-        sections.extend(
-            section
-            for section in extract_fin_sections(fin_response)
-            if any(keyword in section["query"] for keyword in ("市盈率", "市净率", "估值"))
-        )
+        content = compact_fin_section_content(section)
+        if content and section_has_enough_coverage(content):
+            sections.append({**section, "content": content})
     return sections
 
 
@@ -730,6 +823,24 @@ def extract_fin_sections(fin_response):
     return sections
 
 
+def fin_section_title(query, content=""):
+    if "涨跌幅" in query:
+        return "最近涨跌幅"
+    if "20日均线" in query or "60日均线" in query:
+        if "20日均线" not in content and "60日均线" not in content:
+            return "当前股价"
+        return "均线与当前股价"
+    if "成交额" in query:
+        return "成交额变化"
+    if "52周" in query or "一年最高" in query or "1年最高" in query:
+        return "52周价格位置"
+    if any(keyword in query for keyword in ("市盈率", "市净率", "估值")):
+        return "估值指标"
+    if any(keyword in query for keyword in ("营业收入", "净利润", "同比")):
+        return "成长与业绩"
+    return "金融数据查询结果"
+
+
 def build_local_technical_top5(fin_trends_response):
     metrics = {}
     sections = extract_fin_sections(fin_trends_response)
@@ -742,9 +853,9 @@ def build_local_technical_top5(fin_trends_response):
         rows = rows_to_dicts(section["content"])
         if "涨跌幅" in query:
             for row in rows:
-                name = row.get("matched_company_name") or row.get("公司名称") or row.get("证券简称")
-                code = row.get("wind_code") or row.get("证券代码") or row.get("股票代码")
-                value = parse_number(row.get("item_value") or row.get("区间平均涨跌幅") or row.get("最近5个交易日涨跌幅(%)"))
+                name = row_stock_name(row)
+                code = row_stock_code(row)
+                value = parse_number(first_present(row, ("item_value", "区间平均涨跌幅", "最近5个交易日涨跌幅(%)")))
                 if not name or not code:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name})
@@ -753,44 +864,74 @@ def build_local_technical_top5(fin_trends_response):
                     item["short_momentum"] = value
         elif "20日均线" in query and "60日均线" in query:
             for row in rows:
-                name = row.get("公司名称") or row.get("证券简称") or row.get("matched_company_name")
-                code = row.get("证券代码") or row.get("wind_code")
-                ma20 = parse_number(row.get("20日均线价格(元)") or row.get("20日均线(元)") or row.get("20日均线_元"))
-                ma60 = parse_number(row.get("60日均线价格(元)") or row.get("60日均线(元)") or row.get("60日均线_元"))
-                close = parse_number(row.get("收盘价_元") or row.get("当前股价_元") or row.get("当日收盘价(元)"))
+                name = row_stock_name(row)
+                code = row_stock_code(row)
+                item_key = row_item_key(row)
+                item_name = row_item_name(row)
+                value = parse_number(first_present(row, ("item_value", "指标值", "value")))
+                ma20 = parse_number(first_present(row, ("20日均线价格(元)", "20日均线(元)", "20日均线_元")))
+                ma60 = parse_number(first_present(row, ("60日均线价格(元)", "60日均线(元)", "60日均线_元")))
+                close = parse_number(first_present(row, ("收盘价_元", "当前股价_元", "当日收盘价(元)")))
                 if not name:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
                 if item is None:
                     continue
                 item["short_name"] = clean_stock_name(name)
-                item["ma20"] = ma20
-                item["ma60"] = ma60
-                item["close"] = close
+                if value is not None:
+                    normalized = f"{item_key} {item_name}".lower()
+                    if "ma20" in normalized or "20日均线" in normalized:
+                        ma20 = value
+                    elif "ma60" in normalized or "60日均线" in normalized:
+                        ma60 = value
+                    elif item_key == "close" or "收盘价" in item_name or "当前股价" in item_name:
+                        close = value
+                if ma20 is not None:
+                    item["ma20"] = ma20
+                if ma60 is not None:
+                    item["ma60"] = ma60
+                if close is not None:
+                    item["close"] = close
                 item["above_ma20"] = "上方" in row.get("与20日均线位置关系", "") or (
-                    close is not None and ma20 is not None and close > ma20
+                    item.get("close") is not None and item.get("ma20") is not None and item["close"] > item["ma20"]
                 )
                 item["above_ma60"] = "上方" in row.get("与60日均线位置关系", "") or (
-                    close is not None and ma60 is not None and close > ma60
+                    item.get("close") is not None and item.get("ma60") is not None and item["close"] > item["ma60"]
                 )
-                item["ma20_distance"] = parse_number(row.get("偏离20日均线_百分比"))
-                item["ma60_distance"] = parse_number(row.get("偏离60日均线_百分比"))
-                item["distance_52w_high"] = parse_number(
-                    row.get("距离52周高点位置_百分比") or row.get("距52周最高价距离(%)")
-                )
+                ma20_distance = parse_number(row.get("偏离20日均线_百分比"))
+                ma60_distance = parse_number(row.get("偏离60日均线_百分比"))
+                distance_52w_high = parse_number(row.get("距离52周高点位置_百分比") or row.get("距52周最高价距离(%)"))
+                if ma20_distance is not None:
+                    item["ma20_distance"] = ma20_distance
+                if ma60_distance is not None:
+                    item["ma60_distance"] = ma60_distance
+                if distance_52w_high is not None:
+                    item["distance_52w_high"] = distance_52w_high
         elif "52周最高价" in query:
             for row in rows:
-                name = row.get("证券简称") or row.get("公司名称")
-                item = find_metric_by_name(metrics, name)
+                name = row_stock_name(row)
+                code = row_stock_code(row)
+                item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
                 if item is not None:
-                    item["distance_52w_high"] = parse_number(row.get("距52周最高价距离(%)"))
+                    item_key = row_item_key(row)
+                    item_name = row_item_name(row)
+                    value = parse_number(first_present(row, ("item_value", "指标值", "value")))
+                    direct_distance = parse_number(row.get("距52周最高价距离(%)") or row.get("距离52周高点位置_百分比"))
+                    if direct_distance is not None:
+                        item["distance_52w_high"] = direct_distance
+                    elif value is not None:
+                        normalized = f"{item_key} {item_name}".lower()
+                        if item_key == "close" or "收盘价" in item_name or "当前股价" in item_name:
+                            item["close"] = value
+                        elif "high_52w" in normalized or "52周" in item_name or "1年最高" in item_name:
+                            item["high_52w"] = value
         elif use_valuation and any(keyword in query for keyword in ("市盈率", "市净率", "估值")):
             for row in rows:
-                code = row.get("wind_code") or row.get("证券代码") or row.get("股票代码")
-                name = row.get("matched_company_name") or row.get("公司名称") or row.get("证券简称")
-                item_key = row.get("item_key") or row.get("指标代码") or row.get("指标")
-                item_name = row.get("item_name") or row.get("指标名称") or item_key
-                value = parse_number(row.get("item_value") or row.get("指标值") or row.get("value"))
+                code = row_stock_code(row)
+                name = row_stock_name(row)
+                item_key = row_item_key(row)
+                item_name = row_item_name(row)
+                value = parse_number(first_present(row, ("item_value", "指标值", "value")))
                 if value is None:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
@@ -805,6 +946,8 @@ def build_local_technical_top5(fin_trends_response):
 
     rows = []
     for item in metrics.values():
+        if item.get("distance_52w_high") is None and item.get("close") and item.get("high_52w"):
+            item["distance_52w_high"] = (item["close"] / item["high_52w"] - 1) * 100
         momentum = item.get("short_momentum")
         ma20 = item.get("ma20")
         ma60 = item.get("ma60")
@@ -1337,17 +1480,17 @@ def make_html_report(run_id, payloads):
     trend_html = "".join(
         f"""
         <section class="subsection">
-          <h3>{escape(section["query"][:80])}</h3>
+          <h3>{escape(fin_section_title(section["query"], section["content"]))}</h3>
           <div class="meta">{escape(section["source"])} · {escape(section["status"])}</div>
-          {markdown_table_to_html(section["content"], limit=11)}
+          {markdown_table_to_html(section["content"], limit=max(80, EXPECTED_STOCK_COUNT * 2))}
         </section>
         """
         for section in trend_sections
     )
     technical_html = markdown_table_to_html(technical_markdown, limit=5)
     hotspot_html = markdown_table_to_html(hotspot_markdown, limit=8)
-    valuation_html = markdown_table_to_html(valuation_markdown, limit=24) if valuation_markdown else ""
-    growth_html = markdown_table_to_html(growth_markdown, limit=12) if growth_markdown else ""
+    valuation_html = markdown_table_to_html(valuation_markdown, limit=max(40, EXPECTED_STOCK_COUNT)) if valuation_markdown else ""
+    growth_html = markdown_table_to_html(growth_markdown, limit=max(40, EXPECTED_STOCK_COUNT)) if growth_markdown else ""
 
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -1572,7 +1715,7 @@ def make_report(run_id, payloads):
     )
     trend_sections = display_fin_sections(payloads["fin_trends"][1])
     trend_text = "\n\n".join(
-        f"### {section['query']}\n\n{section['content']}" for section in trend_sections
+        f"### {fin_section_title(section['query'], section['content'])}\n\n{section['content']}" for section in trend_sections
     )
     technical_text = technical_top5_markdown(payloads["fin_trends"][1])
     valuation_text = compact_valuation_markdown(payloads["fin_trends"][1])
@@ -1630,7 +1773,7 @@ def make_report(run_id, payloads):
             "",
             "## 7. 历史股价与趋势查询结果",
             "",
-            trend_text[:5000],
+            trend_text,
             "",
             "## 8. 本轮流程结论",
             "",
