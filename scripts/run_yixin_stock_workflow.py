@@ -20,6 +20,7 @@ CHROME_PATH = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 NEWS_LOOKBACK_DAYS = 3
 EXPECTED_STOCK_COUNT = 11
 MAX_CANDIDATES_FOR_TRENDS = 25
+TREND_COMPLETENESS_MIN_RATIO = 0.6
 BLOCKED_NEWS_DOMAINS = (
     "guba.eastmoney.com",
     "xyhndec.cn",
@@ -278,6 +279,19 @@ def parse_item_datetime(value):
         return None
 
 
+def latest_a_share_trade_datetime(now=None):
+    current = now or datetime.now()
+    if current.weekday() == 5:
+        current -= timedelta(days=1)
+    elif current.weekday() == 6:
+        current -= timedelta(days=2)
+    return current
+
+
+def chinese_date(value):
+    return f"{value.year}年{value.month}月{value.day}日"
+
+
 def filter_fresh_news(items, today=None, lookback_days=NEWS_LOOKBACK_DAYS):
     today = today or datetime.now()
     start = today - timedelta(days=lookback_days)
@@ -514,10 +528,105 @@ def markdown_from_dict_rows(rows, headers):
     return "\n".join(lines)
 
 
+def compact_pct_change_range_markdown(section, rows):
+    grouped = {}
+    for row in rows:
+        if row_item_key(row).lower() != "pct_change":
+            continue
+        value = extract_short_momentum(row)
+        code = row_stock_code(row)
+        name = clean_stock_name(row_stock_name(row))
+        if value is None or not code:
+            continue
+        item = grouped.setdefault(code, {"股票代码": code, "股票名称": name, "values": [], "dates": []})
+        item["values"].append(value)
+        date = compact_text(row.get("time_scope_value", ""))
+        if date:
+            item["dates"].append(date)
+    if not grouped:
+        return ""
+
+    field = momentum_field_for_text(section["query"])
+    label_by_field = {
+        "short_momentum": "5日累计涨跌幅(%)",
+        "medium_momentum": "20日累计涨跌幅(%)",
+        "long_momentum": "60日累计涨跌幅(%)",
+    }
+    value_label = label_by_field.get(field, "区间累计涨跌幅(%)")
+    output_rows = []
+    for item in grouped.values():
+        cumulative = cumulative_percent(item["values"])
+        dates = sorted(item["dates"])
+        output_rows.append(
+            {
+                "股票代码": item["股票代码"],
+                "股票名称": item["股票名称"],
+                "统计区间": f"{dates[0]}->{dates[-1]}" if dates else "",
+                value_label: f"{cumulative:.2f}" if cumulative is not None else "暂无",
+                "样本数": len(item["values"]),
+            }
+        )
+    output_rows.sort(key=lambda row: row["股票代码"])
+    return markdown_from_dict_rows(output_rows, ["股票代码", "股票名称", "统计区间", value_label, "样本数"])
+
+
+def compact_close_history_markdown(rows):
+    grouped = {}
+    for row in rows:
+        if row_item_key(row).lower() != "close":
+            continue
+        value = row_metric_value(row)
+        code = row_stock_code(row)
+        name = clean_stock_name(row_stock_name(row))
+        date = compact_text(row.get("time_scope_value", ""))
+        if value is None or not code or not date:
+            continue
+        item = grouped.setdefault(code, {"股票代码": code, "股票名称": name, "history": []})
+        item["history"].append((date, value))
+    if not grouped:
+        return ""
+
+    output_rows = []
+    for item in grouped.values():
+        latest_first = [
+            close
+            for _, close in sorted(item["history"], key=lambda pair: pair[0], reverse=True)
+        ]
+        dates = sorted(date for date, _ in item["history"])
+        ma20 = sum(latest_first[:20]) / 20 if len(latest_first) >= 20 else None
+        ma60 = sum(latest_first[:60]) / 60 if len(latest_first) >= 60 else None
+        output_rows.append(
+            {
+                "股票代码": item["股票代码"],
+                "股票名称": item["股票名称"],
+                "统计区间": f"{dates[0]}->{dates[-1]}" if dates else "",
+                "最新收盘价(元)": f"{latest_first[0]:.2f}" if latest_first else "暂无",
+                "本地20日均线(元)": f"{ma20:.2f}" if ma20 is not None else "暂无",
+                "本地60日均线(元)": f"{ma60:.2f}" if ma60 is not None else "暂无",
+                "样本数": len(latest_first),
+            }
+        )
+    output_rows.sort(key=lambda row: row["股票代码"])
+    return markdown_from_dict_rows(
+        output_rows,
+        ["股票代码", "股票名称", "统计区间", "最新收盘价(元)", "本地20日均线(元)", "本地60日均线(元)", "样本数"],
+    )
+
+
 def compact_fin_section_content(section):
     rows = rows_to_dicts(section["content"])
     if not rows:
         return ""
+
+    if "涨跌幅" in section["query"] and any(row_item_key(row).lower() == "pct_change" for row in rows):
+        compacted = compact_pct_change_range_markdown(section, rows)
+        if compacted:
+            return compacted
+
+    if any(row_item_key(row).lower() == "close" and "range" in compact_text(row.get("subject_type", "")) for row in rows):
+        compacted = compact_close_history_markdown(rows)
+        if compacted:
+            return compacted
 
     if {"wind_code", "item_name", "item_value"}.issubset(rows[0].keys()):
         compact_rows = []
@@ -591,6 +700,350 @@ def row_item_key(row):
 
 def row_item_name(row):
     return compact_text(row.get("item_name") or row.get("指标名称") or row_item_key(row))
+
+
+TREND_MOMENTUM_KEYS = {"pct_change", "avg_pct_change"}
+TREND_MOMENTUM_NAME_KEYWORDS = ("涨跌幅", "区间平均涨跌幅")
+TREND_MOMENTUM_DIRECT_COLUMNS = (
+    "最近5个交易日涨跌幅(%)",
+    "最近5日涨跌幅(%)",
+    "5日涨跌幅(%)",
+    "近5日涨跌幅(%)",
+    "最近20日涨跌幅(%)",
+    "20日涨跌幅(%)",
+    "近20日涨跌幅(%)",
+    "最近60日涨跌幅(%)",
+    "60日涨跌幅(%)",
+    "近60日涨跌幅(%)",
+    "涨跌幅(%)",
+    "区间平均涨跌幅",
+)
+NON_MOMENTUM_KEYS = {
+    "amount",
+    "sum_amount",
+    "avg_amount",
+    "close",
+    "open",
+    "high",
+    "low",
+    "high_52w",
+    "low_52w",
+    "total_mv",
+    "float_mv",
+    "pe_ttm",
+    "pb_lf",
+    "ps_ttm",
+}
+
+
+def row_metric_value(row):
+    return parse_number(first_present(row, ("item_value", "指标值", "value", "数值")))
+
+
+def normalized_row_key_name(row):
+    item_key = row_item_key(row).lower()
+    item_name = row_item_name(row)
+    return item_key, item_name, f"{item_key} {item_name}".lower()
+
+
+def is_sane_percent(value, limit=80):
+    return value is not None and -limit <= value <= limit
+
+
+def cumulative_percent(values):
+    multiplier = 1.0
+    used = 0
+    for value in values:
+        if value is None:
+            continue
+        multiplier *= 1 + value / 100
+        used += 1
+    if not used:
+        return None
+    return (multiplier - 1) * 100
+
+
+def direct_number(row, exact_keys=(), contains_all=()):
+    value = first_present(row, exact_keys)
+    if value is None and contains_all:
+        value = first_key_containing(row, *contains_all)
+    return parse_number(value)
+
+
+def direct_close_value(row):
+    return direct_number(
+        row,
+        (
+            "收盘价_元",
+            "当前股价_元",
+            "当前收盘价_元",
+            "当日收盘价(元)",
+            "收盘价(元)",
+            "当前股价(元)",
+        ),
+        ("收盘价",),
+    )
+
+
+def direct_ma20_value(row):
+    return direct_number(
+        row,
+        ("20日均线价格(元)", "20日均线(元)", "20日均线_元"),
+        ("20日均线",),
+    )
+
+
+def direct_ma60_value(row):
+    return direct_number(
+        row,
+        ("60日均线价格(元)", "60日均线(元)", "60日均线_元"),
+        ("60日均线",),
+    )
+
+
+def direct_high_52w_value(row):
+    return direct_number(
+        row,
+        (
+            "过去52周最高价_元",
+            "52周最高价(元)",
+            "52周最高价_元",
+            "近1年最高价(元)",
+            "过去52周最高价(元)",
+        ),
+        ("52周", "最高"),
+    ) or direct_number(row, contains_all=("1年", "最高"))
+
+
+def momentum_field_for_text(text):
+    text = compact_text(text)
+    has_5 = bool(re.search(r"((最近|近)5(日|个交易日)|5(日|个交易日)(的)?(区间)?涨跌幅)", text))
+    has_20 = bool(re.search(r"((最近|近)20(日|个交易日)|20(日|个交易日)(的)?(区间)?涨跌幅)", text))
+    has_60 = bool(re.search(r"((最近|近)60(日|个交易日)|60(日|个交易日)(的)?(区间)?涨跌幅)", text))
+    if sum([has_5, has_20, has_60]) > 1:
+        return "short_momentum"
+    if has_60:
+        return "long_momentum"
+    if has_20:
+        return "medium_momentum"
+    return "short_momentum"
+
+
+def momentum_field_for_row(row, query=""):
+    row_text = " ".join([row_item_key(row), row_item_name(row), " ".join(row.keys())])
+    if re.search(r"((最近|近)(5|20|60)(日|个交易日)|(5|20|60)(日|个交易日)(的)?(区间)?涨跌幅)", row_text):
+        return momentum_field_for_text(row_text)
+    return momentum_field_for_text(query)
+
+
+def extract_short_momentum(row):
+    direct_value = parse_number(first_present(row, TREND_MOMENTUM_DIRECT_COLUMNS))
+    if is_sane_percent(direct_value):
+        return direct_value
+
+    item_key, item_name, normalized = normalized_row_key_name(row)
+    if item_key in NON_MOMENTUM_KEYS:
+        return None
+    if item_key not in TREND_MOMENTUM_KEYS and not any(keyword in item_name for keyword in TREND_MOMENTUM_NAME_KEYWORDS):
+        return None
+    value = row_metric_value(row)
+    unit = compact_text(row.get("item_unit", ""))
+    if unit and unit != "%" and "percent" not in compact_text(row.get("value_type", "")).lower():
+        return None
+    if not is_sane_percent(value):
+        return None
+    return value
+
+
+def apply_momentum_row(item, row, query=""):
+    value = extract_short_momentum(row)
+    if value is None:
+        return
+    field = momentum_field_for_row(row, query=query)
+    item_key = row_item_key(row).lower()
+    time_scope_type = compact_text(row.get("time_scope_type", ""))
+    subject_type = compact_text(row.get("subject_type", ""))
+    if item_key == "pct_change" and time_scope_type == "trade_date" and "range" in subject_type:
+        item.setdefault(f"_{field}_daily_changes", []).append(value)
+        return
+    item[field] = value
+    if field == "short_momentum":
+        item["short_momentum"] = value
+
+
+def apply_market_metric_row(item, row, use_valuation=False):
+    item_key, item_name, normalized = normalized_row_key_name(row)
+    value = row_metric_value(row)
+    time_scope_type = compact_text(row.get("time_scope_type", ""))
+    subject_type = compact_text(row.get("subject_type", ""))
+
+    close = direct_close_value(row)
+    ma20 = direct_ma20_value(row)
+    ma60 = direct_ma60_value(row)
+    high_52w = direct_high_52w_value(row)
+    if close is not None:
+        item["close"] = close
+    if ma20 is not None:
+        item["ma20"] = ma20
+    if ma60 is not None:
+        item["ma60"] = ma60
+    if high_52w is not None:
+        item["high_52w"] = high_52w
+
+    if value is not None:
+        if item_key == "close" and time_scope_type == "trade_date" and "range" in subject_type:
+            date = compact_text(row.get("time_scope_value", ""))
+            item.setdefault("_close_history", []).append((date, value))
+            return
+        if item_key == "close" or "收盘价" in item_name or "当前股价" in item_name:
+            item["close"] = value
+        elif item_key in {"ma20", "avg_close_20d"} or "20日均线" in item_name:
+            item["ma20"] = value
+        elif item_key in {"ma60", "avg_close_60d"} or "60日均线" in item_name:
+            item["ma60"] = value
+        elif item_key in {"high_52w", "max_high"} or "52周" in item_name or "1年最高" in item_name or "区间最高价" in item_name:
+            item["high_52w"] = value
+        elif use_valuation and (item_key == "pe_ttm" or "市盈率" in item_name):
+            item["pe_ttm"] = value
+        elif use_valuation and (item_key == "pb_lf" or "市净率" in item_name):
+            item["pb"] = value
+
+    ma20_distance = parse_number(row.get("偏离20日均线_百分比"))
+    ma60_distance = parse_number(row.get("偏离60日均线_百分比"))
+    distance_52w_high = parse_number(row.get("距离52周高点位置_百分比") or row.get("距52周最高价距离(%)"))
+    if ma20_distance is not None:
+        item["ma20_distance"] = ma20_distance
+    if ma60_distance is not None:
+        item["ma60_distance"] = ma60_distance
+    if distance_52w_high is not None:
+        item["distance_52w_high"] = distance_52w_high
+
+
+def technical_data_quality(fin_trends_response):
+    source_rows = []
+    name_to_key = {}
+    for section in extract_fin_sections(fin_trends_response):
+        for row in rows_to_dicts(section["content"]):
+            code = row_stock_code(row)
+            name = clean_stock_name(row_stock_name(row))
+            if code and name:
+                name_to_key[name] = code
+            source_rows.append((section["query"], row))
+
+    coverage = {}
+    for query, row in source_rows:
+        code = row_stock_code(row)
+        name = clean_stock_name(row_stock_name(row))
+        key = code or name_to_key.get(name) or name
+        if not key:
+            continue
+        item = coverage.setdefault(
+            key,
+            {
+                "code": code or key,
+                "name": name,
+                "momentum": False,
+                "momentum_5d": False,
+                "momentum_20d": False,
+                "momentum_60d": False,
+                "ma20": False,
+                "ma60": False,
+                "close": False,
+                "high_52w": False,
+                "close_history": [],
+            },
+        )
+        if extract_short_momentum(row) is not None:
+            item["momentum"] = True
+            field = momentum_field_for_row(row, query=query)
+            if field == "short_momentum":
+                item["momentum_5d"] = True
+            elif field == "medium_momentum":
+                item["momentum_20d"] = True
+            elif field == "long_momentum":
+                item["momentum_60d"] = True
+        item_key, item_name, _ = normalized_row_key_name(row)
+        value = row_metric_value(row)
+        time_scope_type = compact_text(row.get("time_scope_type", ""))
+        subject_type = compact_text(row.get("subject_type", ""))
+        if item_key == "close" and time_scope_type == "trade_date" and "range" in subject_type and value is not None:
+            item["close_history"].append((compact_text(row.get("time_scope_value", "")), value))
+        elif direct_close_value(row) is not None or item_key == "close" or "收盘价" in item_name or "当前股价" in item_name:
+            item["close"] = True
+        if direct_ma20_value(row) is not None or item_key in {"ma20", "avg_close_20d"} or "20日均线" in item_name:
+            item["ma20"] = True
+        if direct_ma60_value(row) is not None or item_key in {"ma60", "avg_close_60d"} or "60日均线" in item_name:
+            item["ma60"] = True
+        if direct_high_52w_value(row) is not None or item_key in {"high_52w", "max_high"} or "52周" in item_name or "1年最高" in item_name or "区间最高价" in item_name:
+            item["high_52w"] = True
+    for item in coverage.values():
+        close_history = item.get("close_history", [])
+        if close_history:
+            item["close"] = True
+        if len(close_history) >= 20:
+            item["ma20"] = True
+        if len(close_history) >= 60:
+            item["ma60"] = True
+    total = len(coverage)
+    return {
+        "total": total,
+        "momentum": sum(1 for item in coverage.values() if item["momentum"]),
+        "momentum_5d": sum(1 for item in coverage.values() if item["momentum_5d"]),
+        "momentum_20d": sum(1 for item in coverage.values() if item["momentum_20d"]),
+        "momentum_60d": sum(1 for item in coverage.values() if item["momentum_60d"]),
+        "ma20": sum(1 for item in coverage.values() if item["ma20"]),
+        "ma60": sum(1 for item in coverage.values() if item["ma60"]),
+        "close": sum(1 for item in coverage.values() if item["close"]),
+        "high_52w": sum(1 for item in coverage.values() if item["high_52w"]),
+    }
+
+
+def technical_data_quality_note(fin_trends_response):
+    quality = technical_data_quality(fin_trends_response)
+    total = quality["total"]
+    if total == 0:
+        return "数据完整性：本轮未识别到可用于技术评分的股票代码。"
+    return (
+        "数据完整性："
+        f"识别候选 {total} 只；"
+        f"真实涨跌幅覆盖 {quality['momentum']} 只；"
+        f"5/20/60日涨跌幅覆盖 {quality['momentum_5d']}/{quality['momentum_20d']}/{quality['momentum_60d']} 只；"
+        f"20日均线覆盖 {quality['ma20']} 只；"
+        f"60日均线覆盖 {quality['ma60']} 只；"
+        f"收盘价覆盖 {quality['close']} 只；"
+        f"52周高点覆盖 {quality['high_52w']} 只。"
+        "脚本已禁止把成交额、总市值、PE/PB/PS 等非趋势字段替代为趋势动量。"
+    )
+
+
+def format_momentum_summary(short_momentum, medium_momentum, long_momentum):
+    parts = []
+    if short_momentum is not None:
+        parts.append(f"5日 {short_momentum:.2f}%")
+    if medium_momentum is not None:
+        parts.append(f"20日 {medium_momentum:.2f}%")
+    if long_momentum is not None:
+        parts.append(f"60日 {long_momentum:.2f}%")
+    return " / ".join(parts) if parts else "暂无"
+
+
+def trend_quality_is_sufficient(fin_trends_response):
+    quality = technical_data_quality(fin_trends_response)
+    total = max(quality.get("total", 0), EXPECTED_STOCK_COUNT, 1)
+    required = trend_required_count(total)
+    return (
+        quality.get("momentum", 0) >= required
+        and quality.get("close", 0) >= required
+        and quality.get("ma20", 0) >= required
+        and quality.get("ma60", 0) >= required
+    )
+
+
+def formal_technical_top5_rows(fin_trends_response):
+    rows = build_local_technical_top5(fin_trends_response)
+    if not rows or not trend_quality_is_sufficient(fin_trends_response):
+        return []
+    return rows
 
 
 def clean_stock_name(value):
@@ -729,7 +1182,7 @@ def collect_growth_metrics(fin_trends_response):
                 continue
             if "营业收入" in item_name or row.get("item_key") == "yoy_or":
                 item["revenue_yoy"] = value
-            elif "净利润" in item_name or row.get("item_key") == "yoyprofit":
+            elif "净利润" in item_name or row.get("item_key") in {"yoyprofit", "yoy_net_profit"}:
                 item["profit_yoy"] = value
     return growth_by_code
 
@@ -855,29 +1308,29 @@ def build_local_technical_top5(fin_trends_response):
             for row in rows:
                 name = row_stock_name(row)
                 code = row_stock_code(row)
-                value = parse_number(first_present(row, ("item_value", "区间平均涨跌幅", "最近5个交易日涨跌幅(%)")))
                 if not name or not code:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name})
                 item["short_name"] = clean_stock_name(name)
-                if value is not None:
-                    item["short_momentum"] = value
+                apply_market_metric_row(item, row, use_valuation=use_valuation)
+                apply_momentum_row(item, row, query=query)
         elif "20日均线" in query and "60日均线" in query:
             for row in rows:
                 name = row_stock_name(row)
                 code = row_stock_code(row)
                 item_key = row_item_key(row)
                 item_name = row_item_name(row)
-                value = parse_number(first_present(row, ("item_value", "指标值", "value")))
-                ma20 = parse_number(first_present(row, ("20日均线价格(元)", "20日均线(元)", "20日均线_元")))
-                ma60 = parse_number(first_present(row, ("60日均线价格(元)", "60日均线(元)", "60日均线_元")))
-                close = parse_number(first_present(row, ("收盘价_元", "当前股价_元", "当日收盘价(元)")))
+                value = row_metric_value(row)
+                ma20 = direct_ma20_value(row)
+                ma60 = direct_ma60_value(row)
+                close = direct_close_value(row)
                 if not name:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
                 if item is None:
                     continue
                 item["short_name"] = clean_stock_name(name)
+                apply_market_metric_row(item, row, use_valuation=use_valuation)
                 if value is not None:
                     normalized = f"{item_key} {item_name}".lower()
                     if "ma20" in normalized or "20日均线" in normalized:
@@ -913,9 +1366,10 @@ def build_local_technical_top5(fin_trends_response):
                 code = row_stock_code(row)
                 item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
                 if item is not None:
+                    apply_market_metric_row(item, row, use_valuation=use_valuation)
                     item_key = row_item_key(row)
                     item_name = row_item_name(row)
-                    value = parse_number(first_present(row, ("item_value", "指标值", "value")))
+                    value = row_metric_value(row)
                     direct_distance = parse_number(row.get("距52周最高价距离(%)") or row.get("距离52周高点位置_百分比"))
                     if direct_distance is not None:
                         item["distance_52w_high"] = direct_distance
@@ -925,13 +1379,26 @@ def build_local_technical_top5(fin_trends_response):
                             item["close"] = value
                         elif "high_52w" in normalized or "52周" in item_name or "1年最高" in item_name:
                             item["high_52w"] = value
+        elif any(keyword in query for keyword in ("收盘价", "当前股价", "最高价", "移动平均线")):
+            for row in rows:
+                name = row_stock_name(row)
+                code = row_stock_code(row)
+                if not name and not code:
+                    continue
+                item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
+                if item is None:
+                    continue
+                if name:
+                    item["short_name"] = clean_stock_name(name)
+                    item["name"] = item.get("name") or name
+                apply_market_metric_row(item, row, use_valuation=use_valuation)
         elif use_valuation and any(keyword in query for keyword in ("市盈率", "市净率", "估值")):
             for row in rows:
                 code = row_stock_code(row)
                 name = row_stock_name(row)
                 item_key = row_item_key(row)
                 item_name = row_item_name(row)
-                value = parse_number(first_present(row, ("item_value", "指标值", "value")))
+                value = row_metric_value(row)
                 if value is None:
                     continue
                 item = metrics.setdefault(code, {"code": code, "name": name}) if code else find_metric_by_name(metrics, name)
@@ -944,11 +1411,41 @@ def build_local_technical_top5(fin_trends_response):
                 elif "pb" in normalized_key or "市净率" in normalized_name:
                     item["pb"] = value
 
+    for item in metrics.values():
+        for field in ("short_momentum", "medium_momentum", "long_momentum"):
+            daily_changes = item.get(f"_{field}_daily_changes")
+            cumulative = cumulative_percent(daily_changes or [])
+            if cumulative is not None:
+                item[field] = cumulative
+        close_history = item.get("_close_history", [])
+        if close_history:
+            latest_first = [
+                close
+                for _, close in sorted(
+                    ((date, close) for date, close in close_history if date and close is not None),
+                    key=lambda pair: pair[0],
+                    reverse=True,
+                )
+            ]
+            if latest_first:
+                item["close"] = latest_first[0]
+            if len(latest_first) >= 20:
+                item["ma20"] = sum(latest_first[:20]) / 20
+            if len(latest_first) >= 60:
+                item["ma60"] = sum(latest_first[:60]) / 60
+        if item.get("close") is not None and item.get("ma20") is not None:
+            item["above_ma20"] = item["close"] > item["ma20"]
+        if item.get("close") is not None and item.get("ma60") is not None:
+            item["above_ma60"] = item["close"] > item["ma60"]
+
     rows = []
     for item in metrics.values():
         if item.get("distance_52w_high") is None and item.get("close") and item.get("high_52w"):
             item["distance_52w_high"] = (item["close"] / item["high_52w"] - 1) * 100
-        momentum = item.get("short_momentum")
+        short_momentum = item.get("short_momentum")
+        medium_momentum = item.get("medium_momentum")
+        long_momentum = item.get("long_momentum")
+        momentum = short_momentum if short_momentum is not None else medium_momentum
         ma20 = item.get("ma20")
         ma60 = item.get("ma60")
         above_ma20 = item.get("above_ma20")
@@ -969,17 +1466,30 @@ def build_local_technical_top5(fin_trends_response):
         if momentum is not None:
             if 0 <= momentum <= 6:
                 score += 18 + momentum * 1.5
-                reasons.append("短线动量温和增强")
+                reasons.append("短线动量温和增强" if short_momentum is not None else "阶段动量温和增强")
             elif 6 < momentum <= 12:
                 score += 18
-                reasons.append("短线强势但需防追高")
-                risks.append("短期涨幅偏快")
+                reasons.append("短线强势但需防追高" if short_momentum is not None else "阶段强势但需防追高")
+                risks.append("短期涨幅偏快" if short_momentum is not None else "阶段涨幅偏快")
             elif momentum < 0:
                 score += max(-8, momentum * 2)
-                risks.append("短线动量偏弱")
+                risks.append("短线动量偏弱" if short_momentum is not None else "阶段动量偏弱")
             else:
                 score += 8
-                risks.append("短期过热风险上升")
+                risks.append("短期过热风险上升" if short_momentum is not None else "阶段过热风险上升")
+
+        if medium_momentum is not None and long_momentum is not None:
+            if medium_momentum > 0 and long_momentum > 0:
+                score += 5
+                reasons.append("20/60日趋势同向为正")
+            elif medium_momentum < 0 and long_momentum < 0:
+                score -= 6
+                risks.append("20/60日趋势同向偏弱")
+        elif medium_momentum is not None:
+            if medium_momentum > 0:
+                score += 2
+            elif medium_momentum < 0:
+                score -= 2
 
         if ma20 is not None and ma60 is not None:
             if ma20 > ma60 and above_ma20 and above_ma60:
@@ -1070,7 +1580,7 @@ def build_local_technical_top5(fin_trends_response):
                 "技术结构分": score,
                 "结构状态": structure,
                 "补充维度": " / ".join(valuation or supplement) if (valuation or supplement) else "暂无",
-                "趋势动量": f"{momentum:.2f}%" if momentum is not None else "暂无",
+                "趋势动量": format_momentum_summary(short_momentum, medium_momentum, long_momentum),
                 "量价K线": candle,
                 "缠论结构": chan,
                 "位置风险": position_risk,
@@ -1088,9 +1598,19 @@ def build_local_technical_top5(fin_trends_response):
 
 
 def technical_top5_markdown(fin_trends_response):
-    rows = build_local_technical_top5(fin_trends_response)
+    partial_rows = build_local_technical_top5(fin_trends_response)
+    rows = partial_rows if trend_quality_is_sufficient(fin_trends_response) else []
     if not rows:
-        return "暂无足够趋势数据生成技术结构 TOP 5。"
+        opening = "暂无足够趋势数据生成技术结构 TOP 5。"
+        if partial_rows:
+            opening = "趋势核心字段覆盖未达到正式技术结构 TOP 5 门槛，暂不发布正式排名。"
+        return "\n\n".join(
+            [
+                opening,
+                technical_data_quality_note(fin_trends_response),
+                "建议：继续补齐真实涨跌幅、收盘价、20/60日均线和52周位置；在补数达标前，本轮只作为候选观察池，不输出正式技术 TOP5。",
+            ]
+        )
     headers = [
         "排名",
         "股票代码",
@@ -1115,6 +1635,8 @@ def technical_top5_markdown(fin_trends_response):
         lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
     lines.extend(
         [
+            "",
+            technical_data_quality_note(fin_trends_response),
             "",
             "说明：该 TOP 5 由脚本基于可得趋势和均线数据本地计算。K线和缠论结构为简化框架判断，后续如果 fin_db 能稳定返回完整 OHLCV，将升级为更严格的分型、笔、中枢和蜡烛图识别。",
         ]
@@ -1392,11 +1914,19 @@ def curated_candidate_rows(themes, limit=MAX_CANDIDATES_FOR_TRENDS):
     return rows[:limit]
 
 
-def build_trend_query(candidate_rows):
+def candidate_stock_text(candidate_rows):
     if not candidate_rows:
-        stock_text = "中际旭创、工业富联、新易盛、天孚通信、寒武纪、北方华创、中微公司、汇川技术、机器人、万丰奥威、药明康德"
-    else:
-        stock_text = "、".join(f"{row['股票名称']}({row['股票代码']})" for row in candidate_rows)
+        return "中际旭创、工业富联、新易盛、天孚通信、寒武纪、北方华创、中微公司、汇川技术、机器人、万丰奥威、药明康德"
+    return "、".join(f"{row['股票名称']}({row['股票代码']})" for row in candidate_rows)
+
+
+def chunked_rows(rows, size):
+    for index in range(0, len(rows), size):
+        yield rows[index : index + size]
+
+
+def build_trend_query(candidate_rows):
+    stock_text = candidate_stock_text(candidate_rows)
     return (
         f"请对以下A股候选股票进行横向比较：{stock_text}。"
         "查询最近5日、20日、60日涨跌幅，20日/60日均线趋势，成交额变化，距离52周高点位置，"
@@ -1404,6 +1934,140 @@ def build_trend_query(candidate_rows):
         "请尽量使用完整表格返回，并标记趋势状态：强趋势、低位修复、回调观察、高位谨慎或趋势破坏。"
         "如果某些估值字段缺失，请保留其他完整字段，不要编造数字。"
     )
+
+
+def trend_required_count(total):
+    return max(1, int(total * TREND_COMPLETENESS_MIN_RATIO))
+
+
+def build_supplemental_trend_queries(candidate_rows, fin_trends_response):
+    quality = technical_data_quality(fin_trends_response)
+    total = max(len(candidate_rows), quality.get("total", 0), 1)
+    required = trend_required_count(total)
+    stock_text = candidate_stock_text(candidate_rows)
+    market_date = chinese_date(latest_a_share_trade_datetime())
+    queries = []
+
+    if quality.get("momentum_5d", 0) < required:
+        queries.append(
+            (
+                "momentum_5d",
+                f"查询{stock_text}截至{market_date}最近5个交易日的涨跌幅或区间平均涨跌幅。"
+                "只返回表格，列为：股票代码、股票名称、统计区间、5日涨跌幅(%)。"
+                "不要返回成交额、总市值、市盈率、市净率或其他非涨跌幅字段。",
+            )
+        )
+    if quality.get("momentum_20d", 0) < required:
+        queries.append(
+            (
+                "momentum_20d",
+                f"查询{stock_text}截至{market_date}最近20个交易日的涨跌幅或区间平均涨跌幅。"
+                "只返回表格，列为：股票代码、股票名称、统计区间、20日涨跌幅(%)。"
+                "不要返回成交额、总市值、市盈率、市净率或其他非涨跌幅字段。",
+            )
+        )
+    if quality.get("momentum_60d", 0) < required:
+        queries.append(
+            (
+                "momentum_60d",
+                f"查询{stock_text}截至{market_date}最近60个交易日的涨跌幅或区间平均涨跌幅。"
+                "只返回表格，列为：股票代码、股票名称、统计区间、60日涨跌幅(%)。"
+                "不要返回成交额、总市值、市盈率、市净率或其他非涨跌幅字段。",
+            )
+        )
+    if quality.get("ma20", 0) < required or quality.get("ma60", 0) < required:
+        queries.append(
+            (
+                "moving_average",
+                f"查询{stock_text}在{market_date}的20日均线和60日均线价格，以及当日收盘价。"
+                "必须返回完整表格，列为：股票代码、股票名称、交易日期、收盘价(元)、20日均线(元)、60日均线(元)。",
+            )
+        )
+    if quality.get("high_52w", 0) < required:
+        queries.append(
+            (
+                "high_52w",
+                f"查询{stock_text}在{market_date}的当前股价、过去52周最高价。"
+                "必须返回完整表格，列为：股票代码、股票名称、交易日期、收盘价(元)、过去52周最高价(元)。",
+            )
+        )
+
+    return queries
+
+
+def build_retry_trend_queries(candidate_rows, fin_trends_response):
+    quality = technical_data_quality(fin_trends_response)
+    total = max(len(candidate_rows), quality.get("total", 0), 1)
+    required = trend_required_count(total)
+    stock_text = candidate_stock_text(candidate_rows)
+    market_date = chinese_date(latest_a_share_trade_datetime())
+    queries = []
+    if quality.get("ma20", 0) < required or quality.get("ma60", 0) < required:
+        for index, chunk in enumerate(chunked_rows(candidate_rows, 10), 1):
+            chunk_text = candidate_stock_text(chunk)
+            queries.append(
+                (
+                    f"moving_average_history_{index}",
+                    f"查询{chunk_text}截至{market_date}最近70个交易日的每日收盘价，用于本地计算20日均线和60日均线。"
+                    "只返回表格，列为：股票代码、股票名称、交易日期、收盘价(元)。不要返回成交额、市值或估值。",
+                )
+            )
+    if quality.get("high_52w", 0) < required:
+        queries.append(
+            (
+                "high_52w_retry",
+                f"查询{stock_text}在{market_date}前52周内的最高价，以及{market_date}的收盘价。"
+                "只输出汇总表，不输出每日明细。列名固定为：股票代码、股票名称、交易日期、收盘价_元、过去52周最高价_元、距离52周高点位置_百分比。",
+            )
+        )
+    return queries
+
+
+def merge_fin_responses(base_response, supplemental_responses):
+    merged = dict(base_response)
+    result = list(base_response.get("result", []))
+    success = bool(base_response.get("success", True))
+    for response in supplemental_responses:
+        result.extend(response.get("result", []))
+        success = success and bool(response.get("success", True))
+    merged["success"] = success
+    merged["result"] = result
+    return merged
+
+
+def run_supplemental_trend_queries(fin_db_key, run_id, candidate_rows, base_response):
+    queries = build_supplemental_trend_queries(candidate_rows, base_response)
+    records = []
+    responses = []
+
+    def run_query(label, query):
+        print(f"running fin_trends_supplement_{label}...", flush=True)
+        record = {"label": label, "query": query}
+        safe_label = re.sub(r"[^a-z0-9_]+", "_", label.lower())
+        try:
+            status, response = yixin_fin_db(fin_db_key, query)
+            record["status"] = status
+            records.append(record)
+            responses.append(response)
+            with (DATA_DIR / f"{run_id}-fin_trends_supplement_{safe_label}.json").open("w", encoding="utf-8") as file:
+                json.dump({"status": status, "response": response}, file, ensure_ascii=False, indent=2)
+            time.sleep(1)
+        except Exception as exc:
+            record["error"] = str(exc)
+            records.append(record)
+            with (DATA_DIR / f"{run_id}-fin_trends_supplement_{safe_label}_error.json").open("w", encoding="utf-8") as file:
+                json.dump(record, file, ensure_ascii=False, indent=2)
+            print(f"warning: supplemental trend query {label} failed: {exc}", file=sys.stderr, flush=True)
+
+    for label, query in queries:
+        run_query(label, query)
+
+    merged = merge_fin_responses(base_response, responses)
+    retry_queries = build_retry_trend_queries(candidate_rows, merged)
+    for label, query in retry_queries:
+        run_query(label, query)
+
+    return merge_fin_responses(base_response, responses), records
 
 
 def make_html_report(run_id, payloads):
@@ -1420,9 +2084,17 @@ def make_html_report(run_id, payloads):
         payloads["fin_candidates"][1], valuation_allowed=valuation_allowed
     )
     trend_sections = display_fin_sections(payloads["fin_trends"][1])
+    formal_top5_rows = formal_technical_top5_rows(payloads["fin_trends"][1])
     technical_markdown = technical_top5_markdown(payloads["fin_trends"][1])
     valuation_markdown = compact_valuation_markdown(payloads["fin_trends"][1])
     growth_markdown = compact_growth_markdown(payloads["fin_trends"][1])
+    supplement_count = len(payloads.get("fin_trend_supplements", []))
+    if formal_top5_rows:
+        conclusion_done = f"热点发现、候选池、趋势补数、技术结构 TOP5 已生成。补充查询 {supplement_count} 条。"
+        conclusion_next = "把认可的 TOP5 加入 watchlist，再跑自选股追踪日报。"
+    else:
+        conclusion_done = f"热点发现、候选池和财务数据已完成；趋势覆盖仍不足，当前仅作为候选观察池。补充查询 {supplement_count} 条。"
+        conclusion_next = "先修复或改写趋势字段查询，等真实涨跌幅和均线覆盖达标后再发布正式 TOP5。"
 
     theme_cards = []
     for name, count in themes:
@@ -1672,8 +2344,8 @@ def make_html_report(run_id, payloads):
     <section class="section">
       <h2>本轮结论</h2>
       <div class="callout">
-        <div><strong>已跑通</strong><p>热点发现、候选池、趋势数据、报告生成。</p></div>
-        <div><strong>下一步</strong><p>加入来源过滤、日期去重、候选股评分排序。</p></div>
+        <div><strong>已跑通</strong><p>{escape(conclusion_done)}</p></div>
+        <div><strong>下一步</strong><p>{escape(conclusion_next)}</p></div>
         <div class="risk"><strong>合规边界</strong><p>报告仅作投研辅助，不构成买卖建议。</p></div>
       </div>
     </section>
@@ -1717,9 +2389,23 @@ def make_report(run_id, payloads):
     trend_text = "\n\n".join(
         f"### {fin_section_title(section['query'], section['content'])}\n\n{section['content']}" for section in trend_sections
     )
+    formal_top5_rows = formal_technical_top5_rows(payloads["fin_trends"][1])
     technical_text = technical_top5_markdown(payloads["fin_trends"][1])
     valuation_text = compact_valuation_markdown(payloads["fin_trends"][1])
     growth_text = compact_growth_markdown(payloads["fin_trends"][1])
+    supplement_count = len(payloads.get("fin_trend_supplements", []))
+    if formal_top5_rows:
+        conclusion_lines = [
+            f"- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/趋势/财务数据查询、技术结构评估和 TOP 5 输出；自动补充趋势查询 {supplement_count} 条。",
+            "- 下一步建议：把 TOP 5 中你认可的股票加入 `watchlist.json`，再跑自选股追踪日报。",
+            "- 如果金融数据返回里某些字段缺失，后续工作流会把这些字段标记为“暂无数据”，不硬编数字。",
+        ]
+    else:
+        conclusion_lines = [
+            f"- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/财务数据查询；自动补充趋势查询 {supplement_count} 条后仍未达到正式 TOP5 的趋势覆盖门槛。",
+            "- 当前输出定位：候选观察池，不发布正式技术 TOP5，不建议写入 `watchlist.json` 作为已确认名单。",
+            "- 下一步建议：继续收窄 fin_db 趋势字段查询，优先补齐真实 5/20/60 日涨跌幅、20/60 日均线和 52 周高点位置。",
+        ]
 
     lines = [
         "# 智能选股工作流试跑报告",
@@ -1777,9 +2463,7 @@ def make_report(run_id, payloads):
             "",
             "## 8. 本轮流程结论",
             "",
-            "- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/趋势/财务数据查询、技术结构评估和 TOP 5 输出。",
-            "- 下一步建议：把 TOP 5 中你认可的股票加入 `watchlist.json`，再跑自选股追踪日报。",
-            "- 如果金融数据返回里某些字段缺失，后续工作流会把这些字段标记为“暂无数据”，不硬编数字。",
+            *conclusion_lines,
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1854,9 +2538,15 @@ def main():
 
     print("running fin_trends...", flush=True)
     status, response = yixin_fin_db(fin_db_key, build_trend_query(selected_candidates))
-    payloads["fin_trends"] = (status, response)
     with (DATA_DIR / f"{run_id}-fin_trends.json").open("w", encoding="utf-8") as file:
         json.dump({"status": status, "response": response}, file, ensure_ascii=False, indent=2)
+
+    response, supplement_records = run_supplemental_trend_queries(fin_db_key, run_id, selected_candidates, response)
+    payloads["fin_trends"] = (status, response)
+    payloads["fin_trend_supplements"] = supplement_records
+    if supplement_records:
+        with (DATA_DIR / f"{run_id}-fin_trends_merged.json").open("w", encoding="utf-8") as file:
+            json.dump({"status": status, "response": response, "supplements": supplement_records}, file, ensure_ascii=False, indent=2)
     time.sleep(1)
 
     report = make_report(run_id, payloads)
