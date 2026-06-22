@@ -1,15 +1,25 @@
 .DS_Store
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+.runtime/
 
-data/
+# Generated market data and reports
+data/raw/
+data/processed/
+data/market_snapshot/*.json
+runs/
+metrics/*.csv
+output/
 reports/
 
-.env
+# Local credentials
 .env.*
 api-keys.json
 *.key
 *.pem
 *.p12
 *.pfx
-
