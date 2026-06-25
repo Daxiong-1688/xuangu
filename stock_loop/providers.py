@@ -589,6 +589,36 @@ class YixinProvider(MarketDataProvider):
             str(item.get("name", "")): item
             for item in market_context.get("sectors", [])
         }
+        sector_items = list(market_context.get("sectors", []))
+
+        def sector_context_for(sector_name: str) -> dict[str, Any]:
+            exact = sector_by_name.get(sector_name, {})
+            exact_has_signal = (
+                safe_float(exact.get("hot_score"), 50.0) != 50.0
+                or safe_float(exact.get("capital_flow_score"), 50.0) != 50.0
+                or safe_float(exact.get("news_count"), 0.0)
+            )
+            if exact and exact_has_signal:
+                return exact
+            fuzzy = []
+            for item in sector_items:
+                theme = str(item.get("name", "")).strip()
+                if not theme or theme == sector_name:
+                    continue
+                if theme in sector_name or sector_name in theme:
+                    fuzzy.append(item)
+            if fuzzy:
+                return sorted(
+                    fuzzy,
+                    key=lambda item: (
+                        safe_float(item.get("news_count"), 0.0) or 0.0,
+                        safe_float(item.get("hot_score"), 0.0) or 0.0,
+                        len(str(item.get("name", ""))),
+                    ),
+                    reverse=True,
+                )[0]
+            return exact
+
         candidates = []
         for base in selected:
             code = str(base.get("股票代码", ""))
@@ -598,7 +628,7 @@ class YixinProvider(MarketDataProvider):
             metrics = trend_metrics.get(code, {})
             technical = technical_rows.get(code, {})
             sector_name = base.get("所属主题", "待确认")
-            sector_context = sector_by_name.get(str(sector_name), {})
+            sector_context = sector_context_for(str(sector_name))
             close = safe_float(metrics.get("close"))
             ma20 = safe_float(metrics.get("ma20"))
             ma60 = safe_float(metrics.get("ma60"))
