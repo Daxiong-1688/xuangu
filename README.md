@@ -1,11 +1,6 @@
-# Yixin Stock Selection Loop
+# Stock Selection Loop
 
-基于 Yixin OpenAPI 的 A 股选股 Skill + 文件驱动的每日研究 Loop。
-
-仓库保留原始 `yixin-stock-workflow` Codex Skill，同时增加每日自动运行、
-历史表现追踪、Agent 复盘、策略版本管理和静态研究看板。
-
-> 本项目仅用于投研辅助和学习演示，不构成投资建议。
+一个非产品化、文件驱动的选股 Skill 自动运行项目。
 
 它只做四件事：
 
@@ -20,13 +15,10 @@
 
 ```text
 .
-├── SKILL.md                   # 原始 Yixin Codex Skill
-├── agents/                    # Skill 元数据
-├── references/                # API Key 配置说明
 ├── config/                    # 正式策略、数据源和运行配置
 ├── skills/                    # 选股、复盘、策略迭代业务规则
 ├── stock_loop/                # 可复用核心模块
-├── scripts/                   # Yixin 原工作流 + Loop 入口
+├── scripts/                   # 每日运行、复盘、指标和报告入口
 ├── data/                      # 原始、处理后和文件快照数据
 ├── runs/YYYY-MM-DD/           # 每日独立运行结果
 ├── reviews/                   # 周/月复盘与失败案例预留目录
@@ -42,6 +34,14 @@
 ```bash
 cd /path/to/stock-selection-loop
 python3 scripts/run_daily.py
+```
+
+使用真实 Yixin 时推荐走两阶段入口，先由顶层命令采集 raw，再由 Loop
+消费 raw 生成日报和复盘，避免在 Python Loop 内部嵌套联网子进程：
+
+```bash
+scripts/run_daily_yixin.sh
+scripts/run_daily_yixin.sh --date 2026-06-24
 ```
 
 指定日期或临时覆盖数据源：
@@ -69,8 +69,15 @@ python3 scripts/run_daily.py --provider yixin
 6. 覆盖更新 `metrics/*.csv`，避免重跑重复计数；
 7. 生成历史复盘和策略建议；
 8. 连续多日出现同类问题时生成候选 draft；
-9. 生成 `daily_report.md` 和 `run_log.md`；
-10. 同步更新 `output/latest_report.md`、`summary.md` 和静态 `dashboard.html`。
+9. 生成 `backfill_result.json`、`daily_report.md`、`daily_report.html`、`dashboard.html` 和 `run_log.md`；
+10. 同步更新 `output/latest_report.md`、`latest_report.html`、`summary.md` 和静态 `dashboard.html`。
+
+`scripts/run_daily_yixin.sh` 在此基础上增加两个外部阶段：
+
+1. 如果 `data/raw/yixin/YYYY-MM-DD/` 缺少真实 raw，先顶层调用
+   `yixin-stock-workflow` Skill 生成 raw；
+2. 日报初步生成后，顶层运行 `scripts/backfill_yixin_prices.py` 补查
+   到期观察股真实收盘价，再重算报告和 dashboard。
 
 每天至少产生：
 
@@ -78,11 +85,14 @@ python3 scripts/run_daily.py --provider yixin
 runs/YYYY-MM-DD/
 ├── market_data.json
 ├── selected_stocks.csv
+├── backfill_result.json
 ├── selection_reason.md
 ├── risk_analysis.md
 ├── review_previous.md
 ├── strategy_suggestion.md
 ├── daily_report.md
+├── daily_report.html
+├── dashboard.html
 └── run_log.md
 ```
 
@@ -118,9 +128,9 @@ python3 scripts/generate_report.py --date 2026-06-22
 
 编辑 `config/data_source.yaml` 的 `provider`：
 
-- `mock`：离线、确定性、用于验证 Loop。
+- `mock`：默认。离线、确定性、用于验证 Loop。
 - `file`：读取 `data/market_snapshot/YYYY-MM-DD.json`。
-- `yixin`：默认，调用仓库内的 `yixin-stock-workflow` 脚本。
+- `yixin`：调用已安装的 `yixin-stock-workflow` Skill。
 
 ## 接入真实行情 API
 
@@ -158,7 +168,16 @@ fetch(run_date, tracked_stocks) -> market_data
 
 ### Yixin
 
-`yixin` provider 默认调用仓库内脚本：
+`yixin` provider 默认消费已经生成的 raw，推荐通过：
+
+```bash
+scripts/run_daily_yixin.sh
+```
+
+如果 raw 缺失，`python3 scripts/run_daily.py --provider yixin` 会提示先走外部
+采集入口，而不是继续在 Loop 内部嵌套启动联网子进程。
+
+外部采集默认优先调用仓库内脚本：
 
 ```text
 scripts/run_yixin_stock_workflow.py

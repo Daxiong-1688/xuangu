@@ -10,6 +10,10 @@
   "yixin": {
     "skill_script": "scripts/run_yixin_stock_workflow.py",
     "skip_image": true,
+    "reuse_existing_raw": true,
+    "require_external_raw": true,
+    "workflow_attempts": 3,
+    "retry_delay_seconds": 5,
     "notes": "优先调用仓库内的 Yixin Skill 脚本，原始响应落入 data/raw/yixin/<date>/。API Key 只从环境变量或 ~/.config/yixin-api/api-keys.json 读取。"
   }
 }

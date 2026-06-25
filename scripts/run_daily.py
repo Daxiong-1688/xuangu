@@ -21,11 +21,16 @@ def main() -> None:
         choices=["mock", "file", "yixin"],
         help="临时覆盖 config/data_source.yaml 中的数据源。",
     )
+    parser.add_argument(
+        "--skip-backfill",
+        action="store_true",
+        help="跳过内置历史补价；用于外部两阶段 Yixin wrapper 先生成日报再顶层补价。",
+    )
     args = parser.parse_args()
     run_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
     try:
         with exclusive_file_lock(ROOT / ".runtime" / "daily.lock"):
-            result = run_daily(ROOT, run_date, args.provider)
+            result = run_daily(ROOT, run_date, args.provider, args.skip_backfill)
     except LockUnavailable as exc:
         print(str(exc))
         return

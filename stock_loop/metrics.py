@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .utils import list_run_dates, read_csv, read_json, safe_float, write_csv
+from .utils import list_run_dates, parse_date, read_csv, read_json, safe_float, write_csv
 
 
 RETURN_FIELDS = [
@@ -55,9 +55,21 @@ SIGNAL_FIELDS = [
 ]
 
 
-def _price(snapshot: dict[str, Any], category: str, key: str) -> float | None:
+def _price(
+    snapshot: dict[str, Any],
+    category: str,
+    key: str,
+    expected_date: date | None = None,
+) -> float | None:
     value = snapshot.get("price_book", {}).get(category, {}).get(key)
     if isinstance(value, dict):
+        trade_date = value.get("trade_date")
+        if expected_date is not None and trade_date:
+            try:
+                if parse_date(str(trade_date)) != expected_date:
+                    return None
+            except ValueError:
+                return None
         value = value.get("close")
     return safe_float(value)
 
@@ -84,8 +96,13 @@ def build_return_tracking(
     observation_periods: list[int],
     benchmark_code: str,
     risk_stop_drawdown_pct: float,
+    as_of_date: date | None = None,
 ) -> list[dict[str, Any]]:
-    run_dates = list_run_dates(root)
+    run_dates = [
+        value
+        for value in list_run_dates(root)
+        if as_of_date is None or value <= as_of_date
+    ]
     snapshots = {
         value: read_json(root / "runs" / value.isoformat() / "market_data.json", {})
         for value in run_dates
@@ -101,8 +118,8 @@ def build_return_tracking(
                 continue
             code = selection.get("stock_code", "")
             sector = selection.get("sector", "")
-            benchmark_start = _price(selected_snapshot, "indices", benchmark_code)
-            sector_start = _price(selected_snapshot, "sectors", sector)
+            benchmark_start = _price(selected_snapshot, "indices", benchmark_code, selection_date)
+            sector_start = _price(selected_snapshot, "sectors", sector, selection_date)
             for horizon in observation_periods:
                 base = {
                     "selection_date": selection_date.isoformat(),
@@ -132,7 +149,7 @@ def build_return_tracking(
                 evaluation_date = later_dates[horizon - 1]
                 window_dates = later_dates[:horizon]
                 path = [
-                    _price(snapshots.get(value, {}), "stocks", code)
+                    _price(snapshots.get(value, {}), "stocks", code, value)
                     for value in window_dates
                 ]
                 valid_path = [value for value in path if value is not None]
@@ -146,10 +163,11 @@ def build_return_tracking(
                 max_gain, max_drawdown = _excursions(selected_price, valid_path)
                 evaluation_snapshot = snapshots.get(evaluation_date, {})
                 benchmark_return = _return(
-                    benchmark_start, _price(evaluation_snapshot, "indices", benchmark_code)
+                    benchmark_start,
+                    _price(evaluation_snapshot, "indices", benchmark_code, evaluation_date),
                 )
                 sector_return = _return(
-                    sector_start, _price(evaluation_snapshot, "sectors", sector)
+                    sector_start, _price(evaluation_snapshot, "sectors", sector, evaluation_date)
                 )
                 base.update(
                     {
@@ -250,6 +268,7 @@ def update_all_metrics(
         periods,
         benchmark,
         float(risk_config.get("risk_stop_drawdown_pct", -8.0)),
+        as_of_date,
     )
     write_csv(root / "metrics" / "return_tracking.csv", RETURN_FIELDS, rows)
     completed = [row for row in rows if row.get("status") == "completed"]
@@ -267,11 +286,14 @@ def update_all_metrics(
     write_csv(root / "metrics" / "accuracy.csv", AGG_FIELDS, accuracy)
     write_csv(root / "metrics" / "win_rate.csv", AGG_FIELDS, win_rate)
     write_csv(root / "metrics" / "signal_effectiveness.csv", SIGNAL_FIELDS, signals)
+    status_counts = Counter(str(row.get("status", "")) for row in rows)
     return {
         "tracking_rows": rows,
         "completed_rows": completed,
+        "status_counts": dict(status_counts),
         "accuracy": accuracy,
         "win_rate": win_rate,
         "signals": signals,
-        "pending_count": sum(row.get("status") == "pending" for row in rows),
+        "pending_count": status_counts.get("pending", 0),
+        "price_unavailable_count": status_counts.get("price_unavailable", 0),
     }

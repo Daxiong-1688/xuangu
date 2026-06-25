@@ -13,6 +13,7 @@ from stock_loop.config import load_project_config
 from stock_loop.metrics import update_all_metrics
 from stock_loop.providers import enrich_yixin_market_data_from_raw
 from stock_loop.reporting import (
+    daily_report_html,
     daily_report_markdown,
     generate_dashboard_html,
     generate_output_summary,
@@ -88,10 +89,21 @@ def main() -> None:
         draft_path,
     )
     write_text(run_dir / "daily_report.md", report)
+    write_text(
+        run_dir / "daily_report.html",
+        daily_report_html(report, f"{run_date.isoformat()} 选股 Skill 每日报告"),
+    )
     copy_text(run_dir / "daily_report.md", ROOT / "output" / "latest_report.md")
+    copy_text(run_dir / "daily_report.html", ROOT / "output" / "latest_report.html")
     write_text(ROOT / "output" / "summary.md", generate_output_summary(ROOT, run_date))
     write_text(ROOT / "output" / "dashboard.html", generate_dashboard_html(ROOT, run_date))
+    write_text(
+        run_dir / "dashboard.html",
+        generate_dashboard_html(ROOT, run_date, file_link_base="."),
+    )
     print(f"report={run_dir / 'daily_report.md'}")
+    print(f"html={run_dir / 'daily_report.html'}")
+    print(f"dashboard={run_dir / 'dashboard.html'}")
 
 
 if __name__ == "__main__":

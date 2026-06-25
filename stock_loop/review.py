@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,19 @@ def generate_review_markdown(
     observation_periods: list[int],
 ) -> str:
     completed = metrics.get("completed_rows", [])
+    tracking_rows = metrics.get("tracking_rows", [])
+    status_counts = Counter(str(row.get("status", "")) for row in tracking_rows)
+    pending_count = int(metrics.get("pending_count", status_counts.get("pending", 0)))
+    unavailable_count = int(
+        metrics.get("price_unavailable_count", status_counts.get("price_unavailable", 0))
+    )
     lines = [
         "# 历史观察池复盘",
         "",
         f"- 复盘日期：{run_date.isoformat()}",
         f"- 已完成观察记录：{len(completed)}",
-        f"- 待到期观察记录：{metrics.get('pending_count', 0)}",
+        f"- 缺行情观察记录：{unavailable_count}",
+        f"- 待到期观察记录：{pending_count}",
         "- 说明：收益按各日期快照的收盘价计算；缺失行情不会被视为成功或失败。",
         "",
         "## 分周期表现",
@@ -29,8 +37,17 @@ def generate_review_markdown(
     summary_rows = []
     for horizon in observation_periods:
         items = [row for row in completed if int(row["horizon_days"]) == int(horizon)]
+        horizon_rows = [
+            row for row in tracking_rows if int(row.get("horizon_days", 0)) == int(horizon)
+        ]
+        horizon_unavailable = sum(
+            row.get("status") == "price_unavailable" for row in horizon_rows
+        )
+        horizon_pending = sum(row.get("status") == "pending" for row in horizon_rows)
         if not items:
-            summary_rows.append([horizon, 0, "暂无", "暂无", "暂无", "暂无"])
+            summary_rows.append(
+                [horizon, 0, horizon_unavailable, horizon_pending, "暂无", "暂无", "暂无", "暂无"]
+            )
             continue
         returns = [safe_float(row.get("return_pct"), 0.0) or 0.0 for row in items]
         drawdowns = [safe_float(row.get("max_drawdown_pct"), 0.0) or 0.0 for row in items]
@@ -41,6 +58,8 @@ def generate_review_markdown(
             [
                 horizon,
                 len(items),
+                horizon_unavailable,
+                horizon_pending,
                 pct(sum(returns) / len(returns)),
                 pct(positives / len(items) * 100),
                 pct(min(drawdowns)),
@@ -53,13 +72,49 @@ def generate_review_markdown(
         )
     lines.append(
         markdown_table(
-            ["观察期(交易日)", "样本数", "平均收益", "方向命中率", "最差最大回撤", "跑赢指数比例"],
+            [
+                "观察期(交易日)",
+                "已完成样本",
+                "缺行情",
+                "待到期",
+                "平均收益",
+                "方向命中率",
+                "最差最大回撤",
+                "跑赢指数比例",
+            ],
             summary_rows,
         )
     )
+    unavailable_rows = [
+        row for row in tracking_rows if row.get("status") == "price_unavailable"
+    ]
+    if unavailable_rows:
+        lines.extend(["", "## 缺行情记录", ""])
+        lines.append(
+            markdown_table(
+                ["选股日", "评估日", "代码", "名称", "周期", "状态"],
+                [
+                    [
+                        item.get("selection_date", ""),
+                        item.get("evaluation_date", ""),
+                        item.get("stock_code", ""),
+                        item.get("stock_name", ""),
+                        item.get("horizon_days", ""),
+                        "缺少真实收盘价",
+                    ]
+                    for item in unavailable_rows[:12]
+                ],
+            )
+        )
     lines.extend(["", "## 重点成功与失败案例", ""])
     if not completed:
-        lines.append("历史样本尚未到期。随着每日运行积累，系统会自动补齐 1/3/5/10 日复盘。")
+        if unavailable_count:
+            lines.append(
+                f"当前暂无可评价完成样本；已有 {unavailable_count} 条到期记录缺少真实收盘价，"
+                "已标记为 price_unavailable，不纳入成功、失败、胜率或信号有效性统计。"
+            )
+        else:
+            lines.append("历史样本尚未到期。随着每日运行积累，系统会自动补齐 1/3/5/10 日复盘。")
     else:
         ranked = sorted(completed, key=lambda row: safe_float(row.get("return_pct"), 0.0) or 0.0)
         cases = ranked[:3] + list(reversed(ranked[-3:]))

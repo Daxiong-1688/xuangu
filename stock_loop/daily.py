@@ -5,10 +5,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from .backfill import backfill_yixin_price_unavailable
 from .config import load_project_config
 from .metrics import update_all_metrics
 from .providers import build_provider
 from .reporting import (
+    daily_report_html,
     daily_report_markdown,
     generate_dashboard_html,
     generate_output_summary,
@@ -74,6 +76,7 @@ def run_daily(
     root: Path,
     run_date: date,
     provider_override: str | None = None,
+    skip_backfill: bool = False,
 ) -> dict[str, Any]:
     root = root.resolve()
     ensure_project_dirs(root)
@@ -106,6 +109,19 @@ def run_daily(
             risk_analysis_markdown(run_date, market_data, selected, quality),
         )
 
+        backfill_result = None
+        if provider.name == "yixin" and skip_backfill:
+            backfill_result = {
+                "skipped": True,
+                "reason": "external_backfill_stage_expected",
+            }
+            write_json(run_dir / "backfill_result.json", backfill_result)
+        elif provider.name == "yixin":
+            backfill_result = backfill_yixin_price_unavailable(
+                root, configs["data_source"], run_config, strategy, run_date
+            )
+            write_json(run_dir / "backfill_result.json", backfill_result)
+
         metrics = update_all_metrics(root, run_config, strategy, run_date)
         review_text = generate_review_markdown(run_date, metrics, periods)
         write_text(run_dir / "review_previous.md", review_text)
@@ -124,12 +140,22 @@ def run_daily(
             draft_path,
         )
         write_text(run_dir / "daily_report.md", report_text)
+        write_text(
+            run_dir / "daily_report.html",
+            daily_report_html(report_text, f"{run_date.isoformat()} 选股 Skill 每日报告"),
+        )
         copy_text(run_dir / "daily_report.md", root / "output" / "latest_report.md")
+        copy_text(run_dir / "daily_report.html", root / "output" / "latest_report.html")
         write_text(root / "output" / "summary.md", generate_output_summary(root, run_date))
         if run_config.get("write_dashboard", True):
+            dashboard_text = generate_dashboard_html(root, run_date)
             write_text(
                 root / "output" / "dashboard.html",
-                generate_dashboard_html(root, run_date),
+                dashboard_text,
+            )
+            write_text(
+                run_dir / "dashboard.html",
+                generate_dashboard_html(root, run_date, file_link_base="."),
             )
         write_text(
             run_dir / "run_log.md",
@@ -147,6 +173,7 @@ def run_daily(
             "pool_status": quality["pool_status"],
             "provider": provider.name,
             "draft_path": draft_path,
+            "backfill_result": backfill_result,
         }
     except Exception:
         error = traceback.format_exc()

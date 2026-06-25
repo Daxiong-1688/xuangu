@@ -50,7 +50,8 @@ def selection_reason_markdown(
                 )
                 + ("相对积极。" if item["capital_flow_score"] >= 62 else "暂未形成强确认。"),
                 f"- 技术结构：技术分 {item['technical_score']}；"
-                + _technical_description(candidate),
+                + _technical_description(candidate, item),
+                f"- 结构分项：{item.get('technical_structure') or '暂无结构化分项。'}",
                 f"- 风险点：风险分 {item['risk_score']}（{item['risk_level']}）；"
                 + str(candidate.get("risk_from_source") or _risk_description(candidate)),
                 f"- 观察重点：{item['reason_summary']}。",
@@ -60,7 +61,22 @@ def selection_reason_markdown(
     return "\n".join(lines)
 
 
-def _technical_description(candidate: dict[str, Any]) -> str:
+def _technical_description(candidate: dict[str, Any], selected: dict[str, Any] | None = None) -> str:
+    selected = selected or {}
+    source_bits = []
+    for key in (
+        "source_structure_status",
+        "source_volume_price",
+        "source_chan_structure",
+        "source_position_risk",
+    ):
+        value = str(candidate.get(key) or "").strip()
+        if value and value not in {"暂无", "待确认"}:
+            source_bits.append(value)
+    if source_bits:
+        return "来源结构提示（未作为打分依据）：" + "；".join(source_bits[:4]) + "。"
+    if selected.get("structure_tags"):
+        return "结构标签：" + str(selected["structure_tags"]).replace(";", "、") + "。"
     close = safe_float(candidate.get("close"))
     ma20 = safe_float(candidate.get("ma20"))
     ma60 = safe_float(candidate.get("ma60"))
@@ -119,7 +135,7 @@ def risk_analysis_markdown(
             "## 策略风险",
             "",
             "- 热点、资金、技术结构均可能在收盘后发生变化，评分不是确定性预测。",
-            "- 简化 K 线和缠论描述只用于结构化研究，不能替代完整 OHLCV 分析。",
+            "- 缺少真实 OHLCV 或连续分型/笔/中枢数据时，K线、量价和缠论维度不参与加分。",
             "- 不使用成交额、市值、PE/PB 等字段替代真实涨跌幅、均线或52周位置。",
             "- 系统只生成策略观察和风险提示，不输出交易指令或目标价。",
         ]
@@ -240,6 +256,177 @@ def daily_report_markdown(
     return "\n".join(lines)
 
 
+def daily_report_html(report_markdown: str, title: str = "每日研究报告") -> str:
+    body = _markdown_to_html(report_markdown)
+    escaped_title = html.escape(title)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escaped_title}</title>
+<style>
+:root{{--paper:#f6f5ef;--card:#fffefa;--ink:#171914;--muted:#686e64;--line:#d9d8ce;--blue:#3158ff;--orange:#ff7a1a}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;line-height:1.72}}
+main{{max-width:1120px;margin:0 auto;padding:56px 28px 80px}}
+h1{{font-size:clamp(34px,6vw,64px);line-height:1.04;letter-spacing:-.055em;margin:0 0 26px;border-bottom:2px solid var(--ink);padding-bottom:22px}}
+h2{{font-size:30px;letter-spacing:-.035em;margin:54px 0 16px;border-bottom:1px solid var(--line);padding-bottom:10px}}
+h3{{font-size:20px;margin:30px 0 12px}}
+p,li{{font-size:15px}} ul,ol{{padding-left:22px}} li{{margin:6px 0}}
+table{{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);margin:16px 0 24px;font-size:14px}}
+th,td{{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}
+th{{background:#ecebe2;font-size:12px;letter-spacing:.04em}}
+tr:last-child td{{border-bottom:0}}
+code{{background:#ecebe2;padding:2px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}}
+pre{{background:#191b16;color:#f7f5e9;padding:18px;overflow:auto;border-radius:8px}}
+blockquote{{margin:18px 0;padding:12px 18px;border-left:4px solid var(--blue);background:#eef2ff;color:#30364f}}
+.meta-note{{margin-top:46px;padding:14px 16px;background:#fff3dc;border-left:4px solid var(--orange);color:var(--muted);font-size:13px}}
+@media(max-width:760px){{main{{padding:34px 16px}} table{{display:block;overflow:auto;white-space:nowrap}}}}
+</style>
+</head>
+<body>
+<main>
+{body}
+<div class="meta-note">研究辅助输出，不构成投资建议。HTML 由同目录 daily_report.md 自动渲染生成。</div>
+</main>
+</body>
+</html>"""
+
+
+def _markdown_to_html(markdown: str) -> str:
+    lines = markdown.splitlines()
+    parts: list[str] = []
+    index = 0
+    in_ul = False
+    in_ol = False
+    in_code = False
+    code_lines: list[str] = []
+
+    def close_lists() -> None:
+        nonlocal in_ul, in_ol
+        if in_ul:
+            parts.append("</ul>")
+            in_ul = False
+        if in_ol:
+            parts.append("</ol>")
+            in_ol = False
+
+    while index < len(lines):
+        raw = lines[index]
+        line = raw.strip()
+        if line.startswith("```"):
+            if in_code:
+                parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+                code_lines = []
+                in_code = False
+            else:
+                close_lists()
+                in_code = True
+            index += 1
+            continue
+        if in_code:
+            code_lines.append(raw)
+            index += 1
+            continue
+        if not line:
+            close_lists()
+            index += 1
+            continue
+        if _is_markdown_table_start(lines, index):
+            close_lists()
+            table_lines: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_lines.append(lines[index].strip())
+                index += 1
+            parts.append(_markdown_table_to_html(table_lines))
+            continue
+        if line.startswith("# "):
+            close_lists()
+            parts.append(f"<h1>{_inline_markdown(line[2:].strip())}</h1>")
+        elif line.startswith("## "):
+            close_lists()
+            parts.append(f"<h2>{_inline_markdown(line[3:].strip())}</h2>")
+        elif line.startswith("### "):
+            close_lists()
+            parts.append(f"<h3>{_inline_markdown(line[4:].strip())}</h3>")
+        elif line.startswith("- "):
+            if in_ol:
+                parts.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                parts.append("<ul>")
+                in_ul = True
+            parts.append(f"<li>{_inline_markdown(line[2:].strip())}</li>")
+        elif re.match(r"^\d+\.\s+", line):
+            if in_ul:
+                parts.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                parts.append("<ol>")
+                in_ol = True
+            numbered_item = re.sub(r"^\d+\.\s+", "", line).strip()
+            parts.append(f"<li>{_inline_markdown(numbered_item)}</li>")
+        elif line.startswith("> "):
+            close_lists()
+            parts.append(f"<blockquote>{_inline_markdown(line[2:].strip())}</blockquote>")
+        else:
+            close_lists()
+            parts.append(f"<p>{_inline_markdown(line)}</p>")
+        index += 1
+    close_lists()
+    if in_code:
+        parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+    return "\n".join(parts)
+
+
+def _inline_markdown(value: str) -> str:
+    escaped = html.escape(value)
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+
+
+def _is_markdown_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    current = lines[index].strip()
+    separator = lines[index + 1].strip()
+    return current.startswith("|") and separator.startswith("|") and _is_table_separator(separator)
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _split_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _split_table_row(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _markdown_table_to_html(table_lines: list[str]) -> str:
+    if len(table_lines) < 2:
+        return ""
+    headers = _split_table_row(table_lines[0])
+    body_rows = [
+        _split_table_row(line)
+        for line in table_lines[2:]
+        if not _is_table_separator(line)
+    ]
+    header_html = "".join(f"<th>{_inline_markdown(header)}</th>" for header in headers)
+    rows_html = "\n".join(
+        "<tr>"
+        + "".join(f"<td>{_inline_markdown(cell)}</td>" for cell in row)
+        + "</tr>"
+        for row in body_rows
+    )
+    return (
+        "<table><thead><tr>"
+        + header_html
+        + "</tr></thead><tbody>"
+        + rows_html
+        + "</tbody></table>"
+    )
+
+
 def _section_body(text: str, start: str, end: str) -> str:
     if start not in text:
         return text[:1500]
@@ -257,6 +444,7 @@ def generate_output_summary(root: Path, latest_date: date) -> str:
         "",
         f"- 最新运行日期：{latest_date.isoformat()}",
         f"- 最新日报：`runs/{latest_date.isoformat()}/daily_report.md`",
+        f"- 最新日报 HTML：`runs/{latest_date.isoformat()}/daily_report.html`",
         "- 正式策略不会被自动修改；候选草案位于 `strategy_versions/`。",
         "",
         "## 最新累计指标",
@@ -300,7 +488,11 @@ def generate_output_summary(root: Path, latest_date: date) -> str:
     return "\n".join(lines)
 
 
-def generate_dashboard_html(root: Path, latest_date: date) -> str:
+def generate_dashboard_html(
+    root: Path,
+    latest_date: date,
+    file_link_base: str | None = None,
+) -> str:
     run_dir = root / "runs" / latest_date.isoformat()
     selections = read_csv(run_dir / "selected_stocks.csv")
     market_data = read_json(run_dir / "market_data.json", {})
@@ -323,6 +515,9 @@ def generate_dashboard_html(root: Path, latest_date: date) -> str:
     news = market_data.get("news", [])
     pending_count = sum(row.get("status") == "pending" for row in return_tracking)
     completed_count = sum(row.get("status") == "completed" for row in return_tracking)
+    unavailable_count = sum(
+        row.get("status") == "price_unavailable" for row in return_tracking
+    )
     run_count = len(list_run_dates(root))
 
     def h(value: Any) -> str:
@@ -482,8 +677,24 @@ def generate_dashboard_html(root: Path, latest_date: date) -> str:
         for version, horizon in metric_keys
     ) or (
         f"<tr><td colspan='5'><div class='empty compact'>暂无已到期样本。"
-        f"当前有 {pending_count} 条记录等待 1/3/5/10 个交易日观察完成。</div></td></tr>"
+        f"当前有 {pending_count} 条待到期记录、{unavailable_count} 条缺行情记录；"
+        "缺行情不纳入胜率或失败样本。</div></td></tr>"
     )
+
+    horizons = sorted(
+        {
+            int(row.get("horizon_days", 0))
+            for row in return_tracking
+            if str(row.get("horizon_days", "")).isdigit()
+        }
+    )
+    review_status_rows = "".join(
+        f"<tr><td>{horizon}日</td>"
+        f"<td>{sum(row.get('status') == 'completed' and int(row.get('horizon_days', 0)) == horizon for row in return_tracking)}</td>"
+        f"<td>{sum(row.get('status') == 'price_unavailable' and int(row.get('horizon_days', 0)) == horizon for row in return_tracking)}</td>"
+        f"<td>{sum(row.get('status') == 'pending' and int(row.get('horizon_days', 0)) == horizon for row in return_tracking)}</td></tr>"
+        for horizon in horizons
+    ) or "<tr><td colspan='4'>暂无复盘跟踪记录。</td></tr>"
 
     signal_rows = "".join(
         f"<tr><td><b>{h(row.get('signal'))}</b></td><td>{h(row.get('horizon_days'))}日</td>"
@@ -517,9 +728,14 @@ def generate_dashboard_html(root: Path, latest_date: date) -> str:
         if market_data.get("is_mock")
         else '<div class="notice"><b>外部行情数据</b><span>请结合数据源时间与完整性说明阅读结果。</span></div>'
     )
+    if file_link_base is None:
+        file_link_base = f"../runs/{latest_date.isoformat()}"
+    file_link_base = file_link_base.rstrip("/")
     file_links = "".join(
-        f'<a href="../runs/{latest_date.isoformat()}/{filename}">{label}<span>↗</span></a>'
+        f'<a href="{h(file_link_base + "/" + filename if file_link_base else filename)}">{label}<span>↗</span></a>'
         for filename, label in [
+            ("dashboard.html", "本页看板 HTML"),
+            ("daily_report.html", "完整日报 HTML"),
             ("daily_report.md", "完整日报"),
             ("market_data.json", "市场原始快照"),
             ("selected_stocks.csv", "观察池 CSV"),
@@ -608,7 +824,7 @@ td .score-line{{min-width:140px}} .text-grid{{display:grid;grid-template-columns
   <div class="kpi"><small>完整候选池</small><strong>{len(candidates)}</strong></div>
   <div class="kpi"><small>市场风险</small><strong>{h(market_data.get("market", {}).get("risk_level", "待确认"))}</strong></div>
   <div class="kpi"><small>历史运行日</small><strong>{run_count}</strong></div>
-  <div class="kpi"><small>待到期 / 已完成</small><strong>{pending_count} / {completed_count}</strong></div>
+  <div class="kpi"><small>待到期 / 缺行情 / 已完成</small><strong>{pending_count} / {unavailable_count} / {completed_count}</strong></div>
 </div>
 
 <section id="pool"><div class="section-head"><div><div class="eyebrow">TODAY'S RESEARCH POOL</div><h2>今日观察股票池</h2></div>
@@ -627,8 +843,10 @@ td .score-line{{min-width:140px}} .text-grid{{display:grid;grid-template-columns
 <tbody>{candidate_rows}</tbody></table></div></section>
 
 <section id="review"><div class="section-head"><div><div class="eyebrow">HISTORICAL REVIEW</div><h2>累计复盘与信号效果</h2></div>
-<p>按策略版本和观察周期持续计算；首日数据尚未到期是正常状态。</p></div>
-<div class="panel"><h3>准确率与胜率</h3><div class="table-wrap"><table><thead><tr><th>策略</th><th>周期</th><th>样本</th><th>方向准确率</th><th>胜率</th></tr></thead>
+<p>只把 completed 记录纳入收益、准确率和胜率；price_unavailable 单列为缺行情，不算成功也不算失败。</p></div>
+<div class="panel"><h3>复盘状态分布</h3><div class="table-wrap"><table><thead><tr><th>周期</th><th>已完成</th><th>缺行情</th><th>待到期</th></tr></thead>
+<tbody>{review_status_rows}</tbody></table></div></div>
+<div class="panel" style="margin-top:16px"><h3>准确率与胜率</h3><div class="table-wrap"><table><thead><tr><th>策略</th><th>周期</th><th>样本</th><th>方向准确率</th><th>胜率</th></tr></thead>
 <tbody>{metric_rows}</tbody></table></div></div>
 <div class="panel" style="margin-top:16px"><h3>信号有效性</h3><div class="table-wrap"><table><thead><tr><th>信号</th><th>周期</th><th>样本</th><th>正收益率</th><th>胜率</th><th>平均收益</th><th>平均回撤</th></tr></thead>
 <tbody>{signal_rows}</tbody></table></div></div></section>

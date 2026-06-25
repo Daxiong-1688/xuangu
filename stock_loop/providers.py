@@ -6,6 +6,7 @@ import math
 import re
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from datetime import date, timedelta
 from pathlib import Path
@@ -215,6 +216,51 @@ class FileProvider(MarketDataProvider):
 class YixinProvider(MarketDataProvider):
     name = "yixin"
 
+    def _normalize_trade_date(self, value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text or "->" in text:
+            return None
+        zh_match = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text)
+        if zh_match:
+            year, month, day = zh_match.groups()
+            return f"{year}-{int(month):02d}-{int(day):02d}"
+        match = re.search(r"(20\d{2})[-/]?(\d{2})[-/]?(\d{2})", text)
+        if not match:
+            return None
+        year, month, day = match.groups()
+        return f"{year}-{month}-{day}"
+
+    def _row_trade_date(self, row: dict[str, Any]) -> str | None:
+        for key in (
+            "交易日期",
+            "截止交易日期",
+            "trade_date",
+            "日期",
+            "time_scope_value",
+        ):
+            trade_date = self._normalize_trade_date(row.get(key))
+            if trade_date:
+                return trade_date
+        return None
+
+    def _row_close_value(self, module, row: dict[str, Any]) -> float | None:
+        direct_close = module.direct_close_value(row)
+        if direct_close is not None:
+            return safe_float(direct_close)
+        item_key, item_name, _ = module.normalized_row_key_name(row)
+        value = module.row_metric_value(row)
+        if item_key == "close" or "收盘价" in item_name or "当前股价" in item_name:
+            return safe_float(value)
+        return None
+
+    def _row_close_priority(self, row: dict[str, Any]) -> int:
+        keys = " ".join(str(key) for key in row.keys())
+        if "收盘价(元)" in keys and "复权" not in keys:
+            return 3
+        if "倒数交易日序号" in row:
+            return 2
+        return 1
+
     def _load_workflow_module(self, script: Path):
         spec = importlib.util.spec_from_file_location("installed_yixin_stock_workflow", script)
         if spec is None or spec.loader is None:
@@ -225,7 +271,17 @@ class YixinProvider(MarketDataProvider):
 
     def _extract_closes(self, module, response: dict[str, Any]) -> dict[str, float]:
         return {
-            code: float(item["close"])
+            code: float(point["close"])
+            for code, point in self._extract_price_points(module, response).items()
+            if point.get("close") is not None
+        }
+
+    def _extract_price_points(self, module, response: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {
+            code: {
+                "close": float(item["close"]),
+                "trade_date": item.get("_close_date"),
+            }
             for code, item in self._extract_metrics(module, response).items()
             if item.get("close") is not None
         }
@@ -238,6 +294,13 @@ class YixinProvider(MarketDataProvider):
                 if not code:
                     continue
                 item = metrics.setdefault(code, {})
+                close_value = self._row_close_value(module, row)
+                trade_date = self._row_trade_date(row)
+                if close_value is not None and trade_date:
+                    item.setdefault("_close_history", []).append(
+                        (trade_date, close_value, self._row_close_priority(row))
+                    )
+                    item["_close_date"] = trade_date
                 module.apply_market_metric_row(item, row, use_valuation=False)
                 module.apply_momentum_row(item, row, query=section.get("query", ""))
         for item in metrics.values():
@@ -247,20 +310,28 @@ class YixinProvider(MarketDataProvider):
                 if cumulative is not None:
                     item[field] = cumulative
             close_history = item.get("_close_history", [])
-            latest_first = [
-                close
-                for _, close in sorted(
-                    (
-                        (day, close)
-                        for day, close in close_history
-                        if day and close is not None
-                    ),
-                    key=lambda pair: pair[0],
-                    reverse=True,
-                )
-            ]
-            if latest_first:
-                item["close"] = latest_first[0]
+            dated_closes: dict[str, tuple[float, int]] = {}
+            for entry in close_history:
+                if len(entry) >= 3:
+                    day, close, priority = entry[:3]
+                else:
+                    day, close = entry[:2]
+                    priority = 1
+                normalized_day = self._normalize_trade_date(day)
+                if not normalized_day or close is None:
+                    continue
+                existing = dated_closes.get(normalized_day)
+                if existing is None or int(priority) > existing[1]:
+                    dated_closes[normalized_day] = (close, int(priority))
+            latest_pairs = sorted(
+                ((day, close_priority[0]) for day, close_priority in dated_closes.items()),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+            latest_first = [close for _, close in latest_pairs]
+            if latest_pairs:
+                item["close"] = latest_pairs[0][1]
+                item["_close_date"] = latest_pairs[0][0]
             if len(latest_first) >= 20:
                 item["ma20"] = sum(latest_first[:20]) / 20
             if len(latest_first) >= 60:
@@ -273,11 +344,11 @@ class YixinProvider(MarketDataProvider):
         run_date: date,
         tracked_stocks: list[dict[str, str]],
         raw_dir: Path,
-    ) -> dict[str, float]:
+    ) -> dict[str, dict[str, Any]]:
         if not tracked_stocks:
             return {}
         _, fin_db_key = module.load_keys()
-        prices: dict[str, float] = {}
+        prices: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(tracked_stocks), 30):
             chunk = tracked_stocks[offset : offset + 30]
             labels = "、".join(
@@ -293,7 +364,7 @@ class YixinProvider(MarketDataProvider):
             path = raw_dir / "data" / f"adapter-tracked-prices-{offset // 30 + 1}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
-            prices.update(self._extract_closes(module, response))
+            prices.update(self._extract_price_points(module, response))
         return prices
 
     def _load_latest_response(self, raw_dir: Path, pattern: str) -> dict[str, Any]:
@@ -557,6 +628,7 @@ class YixinProvider(MarketDataProvider):
                     "stock_code": code,
                     "stock_name": name,
                     "sector": sector_name,
+                    "trade_date": metrics.get("_close_date"),
                     "close": close,
                     "pct_change_5": metrics.get("short_momentum"),
                     "pct_change_20": metrics.get("medium_momentum"),
@@ -586,6 +658,13 @@ class YixinProvider(MarketDataProvider):
                     "risk_from_source": (
                         technical.get("主要风险") or base.get("主要风险") or ""
                     ),
+                    "source_structure_status": technical.get("结构状态", ""),
+                    "source_momentum_summary": technical.get("趋势动量", ""),
+                    "source_volume_price": technical.get("量价K线", ""),
+                    "source_chan_structure": technical.get("缠论结构", ""),
+                    "source_position_risk": technical.get("位置风险", ""),
+                    "source_follow_up": technical.get("后续观察点", ""),
+                    "source_supplement": technical.get("补充维度", ""),
                     "yixin_technical_top5": code in technical_rows,
                     "data_origin": "yixin",
                 }
@@ -613,19 +692,81 @@ class YixinProvider(MarketDataProvider):
             raise RuntimeError(f"Yixin Skill 脚本不存在：{script}")
         raw_dir = self.root / "data" / "raw" / "yixin" / run_date.isoformat()
         raw_dir.mkdir(parents=True, exist_ok=True)
-        command = [sys.executable, str(script), "--output-dir", str(raw_dir)]
-        if self.config.get("skip_image", True):
-            command.append("--skip-image")
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        (raw_dir / "adapter_stdout.log").write_text(completed.stdout, encoding="utf-8")
-        (raw_dir / "adapter_stderr.log").write_text(completed.stderr, encoding="utf-8")
-        if completed.returncode != 0:
-            raise RuntimeError(f"Yixin 工作流执行失败：{completed.stderr[-1200:]}")
-
         selected_files = sorted((raw_dir / "data").glob("*-selected_candidates.json"))
         trend_files = sorted((raw_dir / "data").glob("*-fin_trends_merged.json"))
         if not trend_files:
             trend_files = sorted((raw_dir / "data").glob("*-fin_trends.json"))
+        reuse_existing = bool(self.config.get("reuse_existing_raw", True))
+        raw_output_complete = bool(selected_files and trend_files)
+        command = [sys.executable, str(script), "--output-dir", str(raw_dir)]
+        if self.config.get("skip_image", True):
+            command.append("--skip-image")
+        if not (reuse_existing and raw_output_complete):
+            if self.config.get("require_external_raw", False):
+                command_text = " ".join(str(part) for part in command)
+                raise RuntimeError(
+                    "Yixin raw 产物缺失，且当前配置要求外部顶层采集，"
+                    "避免在 Loop 内部嵌套联网子进程。请先运行：\n"
+                    f"  {command_text}\n"
+                    "或使用项目封装入口：\n"
+                    f"  scripts/run_daily_yixin.sh --date {run_date.isoformat()}"
+                )
+            attempts = max(1, int(self.config.get("workflow_attempts", 3)))
+            retry_delay = max(0.0, float(self.config.get("retry_delay_seconds", 5)))
+            transient_markers = (
+                "nodename nor servname provided",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "connection reset",
+                "connection refused",
+                "remote end closed connection",
+                "timed out",
+                "timeout",
+            )
+            stdout_parts: list[str] = []
+            stderr_parts: list[str] = []
+            completed = None
+            for attempt in range(1, attempts + 1):
+                completed = subprocess.run(
+                    command, capture_output=True, text=True, check=False
+                )
+                stdout_parts.append(
+                    f"===== attempt {attempt}/{attempts} =====\n{completed.stdout}"
+                )
+                stderr_parts.append(
+                    f"===== attempt {attempt}/{attempts} =====\n{completed.stderr}"
+                )
+                if completed.returncode == 0:
+                    break
+                error_text = completed.stderr.lower()
+                is_transient = any(
+                    marker in error_text for marker in transient_markers
+                )
+                if not is_transient or attempt == attempts:
+                    break
+                time.sleep(retry_delay * attempt)
+            (raw_dir / "adapter_stdout.log").write_text(
+                "\n".join(stdout_parts), encoding="utf-8"
+            )
+            (raw_dir / "adapter_stderr.log").write_text(
+                "\n".join(stderr_parts), encoding="utf-8"
+            )
+            assert completed is not None
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"Yixin 工作流执行失败：{completed.stderr[-1200:]}"
+                )
+            selected_files = sorted(
+                (raw_dir / "data").glob("*-selected_candidates.json")
+            )
+            trend_files = sorted(
+                (raw_dir / "data").glob("*-fin_trends_merged.json")
+            )
+            if not trend_files:
+                trend_files = sorted((raw_dir / "data").glob("*-fin_trends.json"))
+            raw_capture_mode = "nested_workflow"
+        else:
+            raw_capture_mode = "external_or_reused_raw"
         if not selected_files or not trend_files:
             raise RuntimeError("Yixin 工作流缺少结构化候选或趋势输出。")
 
@@ -639,23 +780,45 @@ class YixinProvider(MarketDataProvider):
         quality = module.technical_data_quality(response)
         market_context = self._market_context(module, raw_dir, selected)
         trend_metrics = self._extract_metrics(module, response)
-        closes = {
-            code: float(item["close"])
+        price_points = {
+            code: {
+                "close": float(item["close"]),
+                "trade_date": item.get("_close_date"),
+            }
             for code, item in trend_metrics.items()
             if item.get("close") is not None
         }
-        tracked_prices = self._fetch_tracked_prices(
-            module, run_date, tracked_stocks, raw_dir
+        missing_tracked_stocks = [
+            item
+            for item in tracked_stocks
+            if item.get("stock_code") not in price_points
+        ]
+        tracked_price_error = ""
+        try:
+            tracked_prices = self._fetch_tracked_prices(
+                module, run_date, missing_tracked_stocks, raw_dir
+            )
+        except Exception as exc:
+            tracked_prices = {}
+            tracked_price_error = f"{type(exc).__name__}: {exc}"
+        price_points.update(tracked_prices)
+        trade_dates = sorted(
+            {
+                str(point.get("trade_date"))
+                for point in price_points.values()
+                if point.get("trade_date")
+            }
         )
-        closes.update(tracked_prices)
+        market_as_of = trade_dates[-1] if trade_dates else run_date.isoformat()
         selected_by_code = {row.get("股票代码"): row for row in selected}
+        tracked_by_code = {row.get("stock_code"): row for row in tracked_stocks}
         candidates = self._build_candidates(
             selected, trend_metrics, formal_rows, partial_rows, market_context
         )
         return {
             "schema_version": "1.0",
             "run_date": run_date.isoformat(),
-            "market_as_of": run_date.isoformat(),
+            "market_as_of": market_as_of,
             "source": self.name,
             "is_mock": False,
             "market": market_context["market"],
@@ -666,11 +829,18 @@ class YixinProvider(MarketDataProvider):
             "price_book": {
                 "stocks": {
                     code: {
-                        "name": selected_by_code.get(code, {}).get("股票名称", ""),
-                        "sector": selected_by_code.get(code, {}).get("所属主题", ""),
-                        "close": close,
+                        "name": (
+                            selected_by_code.get(code, {}).get("股票名称")
+                            or tracked_by_code.get(code, {}).get("stock_name", "")
+                        ),
+                        "sector": (
+                            selected_by_code.get(code, {}).get("所属主题")
+                            or tracked_by_code.get(code, {}).get("sector", "")
+                        ),
+                        "close": point.get("close"),
+                        "trade_date": point.get("trade_date"),
                     }
-                    for code, close in closes.items()
+                    for code, point in price_points.items()
                 },
                 "indices": {},
                 "sectors": {},
@@ -680,13 +850,27 @@ class YixinProvider(MarketDataProvider):
                 "yixin_quality": quality,
                 "notes": [
                     "Yixin 原始响应已保存。",
+                    (
+                        "Yixin raw 来源：外部顶层采集或复用已有产物。"
+                        if raw_capture_mode == "external_or_reused_raw"
+                        else "Yixin raw 来源：Loop 内部兼容采集。"
+                    ),
                     f"已标准化 {market_context['fresh_news_count']} 条新鲜资讯和 "
                     f"{len(market_context['sectors'])} 个热点方向。",
                     "资金/情绪分为资讯文本推断值，不冒充结构化真实资金流。",
                     "若标准化字段覆盖不足，本项目会降级为候选观察池，不强行发布正式排名。",
+                    *(
+                        [
+                            "历史观察标的补充收盘价获取失败；相关到期记录将标记为"
+                            f" price_unavailable。原因：{tracked_price_error}"
+                        ]
+                        if tracked_price_error
+                        else []
+                    ),
                 ],
             },
             "raw_output_dir": str(raw_dir.relative_to(self.root)),
+            "raw_capture_mode": raw_capture_mode,
         }
 
 
@@ -753,7 +937,17 @@ def enrich_yixin_market_data_from_raw(
             "name": item["stock_name"],
             "sector": item["sector"],
             "close": item["close"],
+            "trade_date": item.get("trade_date"),
         }
+    trade_dates = sorted(
+        {
+            str(item.get("trade_date"))
+            for item in stock_book.values()
+            if isinstance(item, dict) and item.get("trade_date")
+        }
+    )
+    if trade_dates:
+        enriched["market_as_of"] = trade_dates[-1]
     price_book["stocks"] = stock_book
     price_book["indices"] = {
         item["code"]: item["close"]
