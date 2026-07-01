@@ -4,7 +4,7 @@
 
 它会扫描最近市场热点，生成候选股票池，查询可得行情/财务数据，做趋势、均线、成长和技术结构评分，并导出 Markdown、HTML 和 PNG 报告。
 
-> 本项目仅用于投研辅助和学习演示，不构成任何买卖建议。
+> 本项目仅用于投研辅助和功能演示，不构成任何买卖建议。
 
 ## Features
 
@@ -77,7 +77,6 @@ reports/
 
 - 不要提交 `~/.config/yixin-api/api-keys.json`。
 - 不要提交真实生成的 `data/` 和 `reports/`，除非已经确认不包含敏感信息。
-- `examples/sample-report.html` 仅作为脱敏示例。
 
 ## License
 

@@ -2091,7 +2091,7 @@ def make_html_report(run_id, payloads):
     supplement_count = len(payloads.get("fin_trend_supplements", []))
     if formal_top5_rows:
         conclusion_done = f"热点发现、候选池、趋势补数、技术结构 TOP5 已生成。补充查询 {supplement_count} 条。"
-        conclusion_next = "把认可的 TOP5 加入 watchlist，再跑自选股追踪日报。"
+        conclusion_next = "将 TOP5 作为人工复核清单，结合盘面、公告和个人风险偏好再判断。"
     else:
         conclusion_done = f"热点发现、候选池和财务数据已完成；趋势覆盖仍不足，当前仅作为候选观察池。补充查询 {supplement_count} 条。"
         conclusion_next = "先修复或改写趋势字段查询，等真实涨跌幅和均线覆盖达标后再发布正式 TOP5。"
@@ -2397,13 +2397,13 @@ def make_report(run_id, payloads):
     if formal_top5_rows:
         conclusion_lines = [
             f"- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/趋势/财务数据查询、技术结构评估和 TOP 5 输出；自动补充趋势查询 {supplement_count} 条。",
-            "- 下一步建议：把 TOP 5 中你认可的股票加入 `watchlist.json`，再跑自选股追踪日报。",
-            "- 如果金融数据返回里某些字段缺失，后续工作流会把这些字段标记为“暂无数据”，不硬编数字。",
+            "- 下一步建议：把 TOP 5 作为人工复核清单，结合盘面、公告和个人风险偏好再判断。",
+            "- 如果金融数据返回里某些字段缺失，本次报告会把这些字段标记为“暂无数据”，不硬编数字。",
         ]
     else:
         conclusion_lines = [
             f"- 本轮已完成：热点扫描、热点质量解读、候选方向识别、候选股/财务数据查询；自动补充趋势查询 {supplement_count} 条后仍未达到正式 TOP5 的趋势覆盖门槛。",
-            "- 当前输出定位：候选观察池，不发布正式技术 TOP5，不建议写入 `watchlist.json` 作为已确认名单。",
+            "- 当前输出定位：候选观察池，不发布正式技术 TOP5，不作为已确认名单。",
             "- 下一步建议：继续收窄 fin_db 趋势字段查询，优先补齐真实 5/20/60 日涨跌幅、20/60 日均线和 52 周高点位置。",
         ]
 

@@ -132,4 +132,4 @@ Use the HTML report for browser review and the PNG report for sharing.
 - If a returned table has incomplete fields, prefer hiding the dimension over showing partial data.
 - If Yixin returns stale search results, rely on local date filtering rather than trusting `time_range`.
 - Never substitute market cap, transaction amount, or valuation fields for trend momentum. If real涨跌幅/均线/52周 fields are missing, show a data completeness note and do not publish a formal technical TOP 5.
-- Report conclusions must match the actual scoring result. If no formal TOP 5 is generated, call the output a `候选观察池`, do not tell the user to add TOP 5 stocks to `watchlist.json`.
+- Report conclusions must match the actual scoring result. If no formal TOP 5 is generated, call the output a `候选观察池`; do not present it as a formal ranking or confirmed list.
