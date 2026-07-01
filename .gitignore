@@ -4,6 +4,8 @@ __pycache__/
 
 data/
 reports/
+state/
+*.jsonl
 
 .env
 .env.*
@@ -12,4 +14,3 @@ api-keys.json
 *.pem
 *.p12
 *.pfx
-

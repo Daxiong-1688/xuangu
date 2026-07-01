@@ -6,6 +6,12 @@
 
 > 本项目仅用于投研辅助和学习演示，不构成任何买卖建议。
 
+## Boundary
+
+本仓库是纯 Codex skill：只负责生成当次研究报告，不保存长期预测记忆，不运行 Agent Loop，不自动学习或切换策略。
+
+实验型 Agent Loop 已拆分到独立仓库 `Daxiong-1688/xuangu-loop`。如果只是分享给别人使用，请安装本仓库；只有需要长期复盘、策略实验和人工批准策略版本时，才使用 loop 仓库。
+
 ## Features
 
 - 最近热点扫描：A 股市场、AI、算力、半导体、机器人、低空经济、创新药等方向。
@@ -73,10 +79,13 @@ data/
 reports/
 ```
 
+普通 skill 不应生成 `state/`；如果本地出现 loop 状态目录，请不要提交到本仓库。
+
 ## Security Notes
 
 - 不要提交 `~/.config/yixin-api/api-keys.json`。
 - 不要提交真实生成的 `data/` 和 `reports/`，除非已经确认不包含敏感信息。
+- 不要把 loop 产生的 `state/` 或 `*.jsonl` 状态文件提交到本 skill 仓库。
 - `examples/sample-report.html` 仅作为脱敏示例。
 
 ## License
